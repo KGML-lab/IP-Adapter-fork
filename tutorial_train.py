@@ -123,7 +123,6 @@ class IPAdapter(torch.nn.Module):
             self.load_from_checkpoint(ckpt_path)
 
     def forward(self, noisy_latents, timesteps, encoder_hidden_states, image_embeds, projection_flag=True):
-        breakpoint()
         if not projection_flag:
             ip_tokens = image_embeds.unsqueeze(1) # [B, 1, 768]
         else:
@@ -272,11 +271,11 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--project_layer",
-        type=bool,
+        "--no_projection_layer",
+        action="store_false",
         default=True,
         help=(
-            "Whether to use a project layer for the CLIP model"
+            "Disable projection layer when this flag is present"
         ),
     )
     
@@ -423,7 +422,7 @@ def main():
                 with torch.no_grad():
                     encoder_hidden_states = text_encoder(batch["text_input_ids"].to(accelerator.device))[0]
                 
-                noise_pred = ip_adapter(noisy_latents, timesteps, encoder_hidden_states, image_embeds)
+                noise_pred = ip_adapter(noisy_latents, timesteps, encoder_hidden_states, image_embeds, projection_flag=args.no_projection_layer)
         
                 loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
             
