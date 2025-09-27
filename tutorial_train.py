@@ -24,16 +24,19 @@ if is_torch2_available():
 else:
     from ip_adapter.attention_processor import IPAttnProcessor, AttnProcessor
 
+import open_clip
+
 
 # Dataset
 class MyDataset(torch.utils.data.Dataset):
 
-    def __init__(self, json_file, tokenizer, size=512, t_drop_rate=0.05, i_drop_rate=0.05, ti_drop_rate=0.05, image_root_path=""):
+    def __init__(self, json_file, tokenizer, size=512, t_drop_rate=0.05, i_drop_rate=0.05, ti_drop_rate=0.05, image_root_path="", bioclip_tokenizer=None):
         super().__init__()
 
         self.tokenizer = tokenizer
         self.size = size
         self.i_drop_rate = i_drop_rate
+        self.bioclip_tokenizer = bioclip_tokenizer
         self.t_drop_rate = t_drop_rate
         self.ti_drop_rate = ti_drop_rate
         self.image_root_path = image_root_path
@@ -52,6 +55,7 @@ class MyDataset(torch.utils.data.Dataset):
         item = self.data[idx] 
         text = item["text"]
         image_file = item["image_file"]
+        taxonomic_name = item["taxonomic_name"]
         
         # read image
         raw_image = Image.open(os.path.join(self.image_root_path, image_file))
@@ -76,12 +80,15 @@ class MyDataset(torch.utils.data.Dataset):
             truncation=True,
             return_tensors="pt"
         ).input_ids
+
+        taxa_tokenized = self.bioclip_tokenizer(taxonomic_name)
         
         return {
             "image": image,
             "text_input_ids": text_input_ids,
             "clip_image": clip_image,
-            "drop_image_embed": drop_image_embed
+            "drop_image_embed": drop_image_embed,
+            "taxa_tokenized": taxa_tokenized
         }
 
     def __len__(self):
@@ -91,6 +98,7 @@ class MyDataset(torch.utils.data.Dataset):
 def collate_fn(data):
     images = torch.stack([example["image"] for example in data])
     text_input_ids = torch.cat([example["text_input_ids"] for example in data], dim=0)
+    taxa_tokenized = torch.cat([example["taxa_tokenized"] for example in data], dim=0)
     clip_images = torch.cat([example["clip_image"] for example in data], dim=0)
     drop_image_embeds = [example["drop_image_embed"] for example in data]
 
@@ -98,7 +106,8 @@ def collate_fn(data):
         "images": images,
         "text_input_ids": text_input_ids,
         "clip_images": clip_images,
-        "drop_image_embeds": drop_image_embeds
+        "drop_image_embeds": drop_image_embeds,
+        "taxa_tokenized": taxa_tokenized
     }
     
 
@@ -113,9 +122,13 @@ class IPAdapter(torch.nn.Module):
         if ckpt_path is not None:
             self.load_from_checkpoint(ckpt_path)
 
-    def forward(self, noisy_latents, timesteps, encoder_hidden_states, image_embeds):
-        ip_tokens = self.image_proj_model(image_embeds)
-        encoder_hidden_states = torch.cat([encoder_hidden_states, ip_tokens], dim=1)
+    def forward(self, noisy_latents, timesteps, encoder_hidden_states, image_embeds, projection_flag=True):
+        breakpoint()
+        if not projection_flag:
+            ip_tokens = image_embeds.unsqueeze(1) # [B, 1, 768]
+        else:
+            ip_tokens = self.image_proj_model(image_embeds) # [B, 4, 768]
+        encoder_hidden_states = torch.cat([encoder_hidden_states, ip_tokens], dim=1) # [B, 81, 768]
         # Predict the noise residual
         noise_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
         return noise_pred
@@ -249,6 +262,25 @@ def parse_args():
             ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
         ),
     )
+    parser.add_argument(
+        "--clip_extra_context_tokens",
+        type=int,
+        default=4,
+        help=(
+            "Number of extra context tokens to use for the CLIP model"
+        ),
+    )
+
+    parser.add_argument(
+        "--project_layer",
+        type=bool,
+        default=True,
+        help=(
+            "Whether to use a project layer for the CLIP model"
+        ),
+    )
+    
+
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     
     args = parser.parse_args()
@@ -282,17 +314,22 @@ def main():
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path)
+
+    bioclip, preprocess_train, preprocess_val = open_clip.create_model_and_transforms('hf-hub:imageomics/bioclip-2')
+    bioclip_tokenizer = open_clip.get_tokenizer('hf-hub:imageomics/bioclip-2')
     # freeze parameters of models to save more memory
     unet.requires_grad_(False)
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     image_encoder.requires_grad_(False)
+    bioclip.requires_grad_(False)
     
     #ip-adapter
     image_proj_model = ImageProjModel(
         cross_attention_dim=unet.config.cross_attention_dim,
-        clip_embeddings_dim=image_encoder.config.projection_dim,
-        clip_extra_context_tokens=4,
+        # clip_embeddings_dim=image_encoder.config.projection_dim, # TODO: change this for bioclip
+        clip_embeddings_dim=768,
+        clip_extra_context_tokens=args.clip_extra_context_tokens,
     )
     # init adapter modules
     attn_procs = {}
@@ -331,13 +368,14 @@ def main():
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     image_encoder.to(accelerator.device, dtype=weight_dtype)
+    bioclip.to(accelerator.device, dtype=weight_dtype)
     
     # optimizer
     params_to_opt = itertools.chain(ip_adapter.image_proj_model.parameters(),  ip_adapter.adapter_modules.parameters())
     optimizer = torch.optim.AdamW(params_to_opt, lr=args.learning_rate, weight_decay=args.weight_decay)
     
     # dataloader
-    train_dataset = MyDataset(args.data_json_file, tokenizer=tokenizer, size=args.resolution, image_root_path=args.data_root_path)
+    train_dataset = MyDataset(args.data_json_file, tokenizer=tokenizer, size=args.resolution, image_root_path=args.data_root_path, bioclip_tokenizer=bioclip_tokenizer)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
@@ -372,7 +410,8 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
             
                 with torch.no_grad():
-                    image_embeds = image_encoder(batch["clip_images"].to(accelerator.device, dtype=weight_dtype)).image_embeds
+                    image_embeds = bioclip.encode_text(batch["taxa_tokenized"].to(accelerator.device)) # bioclip text encoder
+                    # image_embeds = image_encoder(batch["clip_images"].to(accelerator.device, dtype=weight_dtype)).image_embeds
                 image_embeds_ = []
                 for image_embed, drop_image_embed in zip(image_embeds, batch["drop_image_embeds"]):
                     if drop_image_embed == 1:
@@ -410,3 +449,5 @@ def main():
                 
 if __name__ == "__main__":
     main()    
+
+# python tutorial_train.py   --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5"   --image_encoder_path="/users/PAS2136/mridul/scratchpad/taxabind/IP-Adapter/models/image_encoder"   --data_json_file="/fs/ess/PAS2136/bio_diffusion/data/inat/images/train_mini_birds.json"   --data_root_path="/fs/ess/PAS2136/bio_diffusion/data/inat/images"   --mixed_precision="fp16"   --resolution=512   --train_batch_size=64   --dataloader_num_workers=4   --learning_rate=1e-04   --weight_decay=0.01   --output_dir="/fs/ess/PAS2136/bio_diffusion/test_runs/ip-adapter"   --save_steps=10000
