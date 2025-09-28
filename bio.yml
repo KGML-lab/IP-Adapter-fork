@@ -1,0 +1,32 @@
+# bio_up.yml  (Python 3.10 recommended)
+name: bio_up
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch
+  - torchvision          # install with conda to match torch/CUDA
+  - pytorch-cuda=12.1    # pulls compatible CUDA libs; don't pin nvidia-* by hand
+  - numpy>=1.26
+  - pillow
+  - pyyaml
+  - requests
+  - typing_extensions
+  - git-lfs              # optional; only if you need LFS (better than pip 'git-lfs')
+  - pip:
+      - accelerate==1.0.1
+      - diffusers==0.22.1          # keep this pin if IP-Adapter expects ~0.22 API
+      - ip-adapter==0.1.0
+      - huggingface-hub==0.25.2
+      - open-clip-torch==2.32.0
+      - timm==1.0.20
+      - transformers==4.46.3
+      - tokenizers==0.20.3
+      - safetensors==0.5.3
+      - ftfy==6.2.3
+      - fsspec>=2024.9.0
+      - regex>=2024.5.15
+      - rshf>=0.1.2
