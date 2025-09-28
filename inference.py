@@ -113,8 +113,8 @@ def main():
 
     config = PretrainedConfig.from_pretrained("MVRL/taxabind-config")
     taxabind = TaxaBind(config)
-    location_encoder = taxabind.get_location_encoder()
-    taxabind_image_text_model   = taxabind.get_image_text_encoder()  # open_clip model
+    location_encoder = taxabind.get_location_encoder().eval()
+    taxabind_image_text_model   = taxabind.get_image_text_encoder().eval()  # open_clip model
     taxabind_tokenizer = taxabind.get_tokenizer()   
 
     # 3) Load JSON
@@ -134,25 +134,36 @@ def main():
     print(f"Found {len(unique_items)} unique taxonomic names (from {len(items)} rows).")
 
 
-
+    if args.model_type =='bioclip':
+        image_encoder = bioclip_model
+        tokenizer = bioclip_tok
+    elif args.model_type =='taxabind':
+        image_encoder = taxabind_image_text_model
+        tokenizer = taxabind_tokenizer
+    elif args.model_type =='location':
+        image_encoder = location_encoder
+    
     # 3) IP-Adapter wrapper (BioCLIP mode)
     ip_model = IPAdapter(
         pipe,
-        image_encoder_path=bioclip_model,   # pass the *instance*
+        image_encoder_path=image_encoder,   # pass the *instance*
         ip_ckpt=args.ip_ckpt,
         device=device,
-        model_type="bioclip"
+        model_type=args.model_type,
     )
 
     # 4) Loop over entries and generate+save into per-class folder
     for idx, entry in tqdm(enumerate(unique_items, start=1), total=len(unique_items)):
-        tax_name = entry["taxonomic_name"]
+        taxa_name = entry["taxonomic_name"]
         rel_img_path = entry["image_file"]  # not used for conditioning; used to name the class dir
+        location = torch.tensor([entry["latitude"], entry["longitude"]])
         class_dir = class_dir_from_image_path(rel_img_path)
         save_dir = os.path.join(args.out_dir, class_dir)
 
-        # BioCLIP text tokens
-        tokens = bioclip_tok(tax_name).to(device)
+        if args.model_type == "bioclip" or args.model_type == "taxabind":
+            tokens = tokenizer(taxa_name).to(device)
+        elif args.model_type == "location":
+            tokens = location.unsqueeze(0).to(device)
 
         # Generate (NOTE: call with bioclip_tokens; do NOT pass tokens to pil_image)
         images = ip_model.generate(
