@@ -7,6 +7,8 @@ import torch
 from diffusers import StableDiffusionPipeline, DDIMScheduler, AutoencoderKL
 
 import open_clip
+from transformers import PretrainedConfig
+from rshf.taxabind import TaxaBind
 
 # import your improved class (the one we discussed that supports model_type='bioclip'
 # and accepts bioclip tokens / taxa_texts)
@@ -90,8 +92,8 @@ def parse_args():
     p.add_argument("--out_dir", default="outputs_bioclip")
     p.add_argument("--num_tokens", type=int, default=4, help="must match training")
 
-    # NEW: JSON input
     p.add_argument("--json_file", required=True, help="Path to JSON list of dicts.")
+    p.add_argument("--model_type", default="bioclip", choices=["bioclip", "taxabind", "location"], help="Which model type was used during IP-Adapter training?")
     return p.parse_args()
 
 
@@ -109,16 +111,29 @@ def main():
     bioclip_model, _, _ = open_clip.create_model_and_transforms("hf-hub:imageomics/bioclip-2")
     bioclip_tok = open_clip.get_tokenizer("hf-hub:imageomics/bioclip-2")
 
+    config = PretrainedConfig.from_pretrained("MVRL/taxabind-config")
+    taxabind = TaxaBind(config)
+    location_encoder = taxabind.get_location_encoder()
+    taxabind_image_text_model   = taxabind.get_image_text_encoder()  # open_clip model
+    taxabind_tokenizer = taxabind.get_tokenizer()   
+
     # 3) Load JSON
     with open(args.json_file, "r") as f:
         items = json.load(f)
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # --- NEW: de-duplicate by taxonomic_name (keep the FIRST full dict) ---
+    seen = set()
+    unique_items = []
+    for ex in items:
+        tax = ex["taxonomic_name"]
+        if tax not in seen:
+            seen.add(tax)
+            unique_items.append(ex)
 
-    # text = "Animalia Chordata Aves Gruiformes Rallidae Rallus"
-    # # text = 'Animalia Chordata Aves Anseriformes Anatidae Bucephala'
-    # # text = 'Animalia Chordata Aves Passeriformes Hirundinidae Stelgidopteryx'
-    # text_tokenized = bioclip_tok(text).to(device)
+    print(f"Found {len(unique_items)} unique taxonomic names (from {len(items)} rows).")
+
+
 
     # 3) IP-Adapter wrapper (BioCLIP mode)
     ip_model = IPAdapter(
@@ -129,19 +144,10 @@ def main():
         model_type="bioclip"
     )
 
-    # # 4) Generate
-    # images = ip_model.generate(
-    #     pil_image=text_tokenized, 
-    #     num_samples=args.num_samples, 
-    #     num_inference_steps=args.steps, 
-    #     seed=args.seed, 
-    #     guidance_scale=args.guidance_scale,
-    #     )
-
     # 4) Loop over entries and generate+save into per-class folder
-    for idx, ex in tqdm(enumerate(items[:10])):
-        tax_name = ex["taxonomic_name"]
-        rel_img_path = ex["image_file"]  # not used for conditioning; used to name the class dir
+    for idx, entry in tqdm(enumerate(unique_items, start=1), total=len(unique_items)):
+        tax_name = entry["taxonomic_name"]
+        rel_img_path = entry["image_file"]  # not used for conditioning; used to name the class dir
         class_dir = class_dir_from_image_path(rel_img_path)
         save_dir = os.path.join(args.out_dir, class_dir)
 
