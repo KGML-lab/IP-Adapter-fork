@@ -64,19 +64,26 @@ class MLPProjModel(torch.nn.Module):
 
 
 class IPAdapter:
-    def __init__(self, sd_pipe, image_encoder_path, ip_ckpt, device, num_tokens=4):
+    def __init__(self, sd_pipe, image_encoder_path, ip_ckpt, device, num_tokens=4, model_type='clip'):
         self.device = device
         self.image_encoder_path = image_encoder_path
         self.ip_ckpt = ip_ckpt
         self.num_tokens = num_tokens
+        self.model_type = model_type
 
         self.pipe = sd_pipe.to(self.device)
         self.set_ip_adapter()
 
         # load image encoder
-        self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(self.image_encoder_path).to(
-            self.device, dtype=torch.float16
-        )
+        if model_type == 'clip':
+            self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(self.image_encoder_path).to(
+                self.device, dtype=torch.float16
+            )
+        elif model_type == 'bioclip' or  model_type == 'taxabind':
+            self.image_encoder = image_encoder_path.to(self.device, dtype=torch.float16)
+        elif model_type == 'location':
+            self.image_encoder = image_encoder_path.to(self.device)
+
         self.clip_image_processor = CLIPImageProcessor()
         # image proj model
         self.image_proj_model = self.init_proj()
@@ -84,9 +91,21 @@ class IPAdapter:
         self.load_ip_adapter()
 
     def init_proj(self):
+        if self.model_type == "clip":
+            image_encoder_dim = self.image_encoder.config.projection_dim
+        elif self.model_type == "bioclip":
+            # image_encoder_dim = bioclip.text_projection.shape[1]
+            image_encoder_dim = 768
+        elif self.model_type == "taxabind":
+            # image_encoder_dim = location_encoder.config.hidden_size
+            image_encoder_dim = 512
+        elif self.model_type == "location":
+            # image_encoder_dim = location_encoder.config.hidden_size
+            image_encoder_dim = 512
+
         image_proj_model = ImageProjModel(
             cross_attention_dim=self.pipe.unet.config.cross_attention_dim,
-            clip_embeddings_dim=self.image_encoder.config.projection_dim,
+            clip_embeddings_dim=image_encoder_dim,
             clip_extra_context_tokens=self.num_tokens,
         ).to(self.device, dtype=torch.float16)
         return image_proj_model
@@ -138,15 +157,31 @@ class IPAdapter:
 
     @torch.inference_mode()
     def get_image_embeds(self, pil_image=None, clip_image_embeds=None):
-        if pil_image is not None:
-            if isinstance(pil_image, Image.Image):
-                pil_image = [pil_image]
-            clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
-            clip_image_embeds = self.image_encoder(clip_image.to(self.device, dtype=torch.float16)).image_embeds
-        else:
-            clip_image_embeds = clip_image_embeds.to(self.device, dtype=torch.float16)
-        image_prompt_embeds = self.image_proj_model(clip_image_embeds)
-        uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(clip_image_embeds))
+        if self.model_type == 'clip':
+            if pil_image is not None:
+                if isinstance(pil_image, Image.Image):
+                    pil_image = [pil_image]
+                clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
+                clip_image_embeds = self.image_encoder(clip_image.to(self.device, dtype=torch.float16)).image_embeds
+            else:
+                clip_image_embeds = clip_image_embeds.to(self.device, dtype=torch.float16)
+            image_prompt_embeds = self.image_proj_model(clip_image_embeds)
+            uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(clip_image_embeds))
+
+        elif self.model_type == 'bioclip':
+            text_emb = self.image_encoder.encode_text(pil_image)
+            image_prompt_embeds = self.image_proj_model(text_emb)
+            uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(text_emb))
+        elif self.model_type == 'taxabind':
+            text_emb = self.image_encoder.encode_text(pil_image)
+            image_prompt_embeds = self.image_proj_model(text_emb)
+            uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(text_emb))
+        elif self.model_type == 'location':
+            location_emb = self.image_encoder(pil_image).to(dtype=torch.float16)
+            image_prompt_embeds = self.image_proj_model(location_emb)
+            uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(location_emb))
+
+
         return image_prompt_embeds, uncond_image_prompt_embeds
 
     def set_scale(self, scale):
@@ -183,7 +218,6 @@ class IPAdapter:
             prompt = [prompt] * num_prompts
         if not isinstance(negative_prompt, List):
             negative_prompt = [negative_prompt] * num_prompts
-
         image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(
             pil_image=pil_image, clip_image_embeds=clip_image_embeds
         )
