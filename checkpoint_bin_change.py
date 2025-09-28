@@ -4,7 +4,7 @@ from diffusers import UNet2DConditionModel
 
 # --- EDIT THESE ---
 BASE_MODEL = "runwayml/stable-diffusion-v1-5"       # same base you trained with
-CKPT_DIR   = "/fs/ess/PAS2136/bio_diffusion/ip-adapter_runs/bioclip/extra_context4_2gpus/checkpoint-48000/"
+CKPT_DIR   = "/scratch/bio_diffusion/ip-adapter_runs/bioclip/bioclip_location_context4/checkpoint-22000/"
 IN_SFT     = os.path.join(CKPT_DIR, "model.safetensors")
 OUT_BIN    = os.path.join(CKPT_DIR, "ip_adapter.bin")
 OUT_SFT    = os.path.join(CKPT_DIR, "ip_adapter.safetensors")
@@ -16,6 +16,11 @@ sd = load_file(IN_SFT, device="cpu")
 image_proj_sd = {k.replace("image_proj_model.", "", 1): v
                  for k, v in sd.items() if k.startswith("image_proj_model.")}
 print("projector param tensors:", len(image_proj_sd))  # expect 4 (proj/norm {weight,bias})
+
+image_proj2_sd = {k.replace("image_proj_model_secondary.", "", 1): v
+                 for k, v in sd.items() if k.startswith("image_proj_model_secondary.")}
+print("projector param tensors:", len(image_proj2_sd))  #
+
 
 # Build a reference UNet to get the exact attn processor order (so indices match)
 unet_ref = UNet2DConditionModel.from_pretrained(BASE_MODEL, subfolder="unet")
@@ -48,11 +53,12 @@ if not image_proj_sd or not ip_adapter_sd:
     sys.exit("No params found; adjust prefixes or BASE_MODEL/CKPT_DIR.")
 
 # --- Save nested .bin (your loader's non-safetensors path) ---
-torch.save({"image_proj": image_proj_sd, "ip_adapter": ip_adapter_sd}, OUT_BIN)
+torch.save({"image_proj": image_proj_sd, "image_proj2": image_proj2_sd, "ip_adapter": ip_adapter_sd}, OUT_BIN)
 print("Wrote", OUT_BIN)
 
 # --- Also save flat .safetensors (your loader's safetensors path) ---
 flat = {f"image_proj.{k}": v for k, v in image_proj_sd.items()}
+flat.update({f"image_proj2.{k}": v for k, v in image_proj2_sd.items()})
 flat.update({f"ip_adapter.{k}": v for k, v in ip_adapter_sd.items()})
 save_file(flat, OUT_SFT)
 print("Wrote", OUT_SFT)
