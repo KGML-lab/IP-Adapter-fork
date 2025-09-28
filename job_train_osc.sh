@@ -34,7 +34,7 @@ echo "Starting accelerate..."
 
 ## context 4
 
-# accelerate launch --num_processes 4 --multi_gpu tutorial_train.py \
+# accelerate launch --num_processes 2 --multi_gpu tutorial_train.py \
 # --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
 # --image_encoder_path="/users/PAS2136/mridul/scratchpad/taxabind/IP-Adapter/models/image_encoder" \
 # --data_json_file="/fs/ess/PAS2136/bio_diffusion/data/inat/images/train_mini_birds.json" \
@@ -42,17 +42,17 @@ echo "Starting accelerate..."
 # --mixed_precision="fp16" \
 # --resolution=512 \
 # --train_batch_size=64 \
-# --dataloader_num_workers=4 \
+# --dataloader_num_workers=8 \
 # --learning_rate=1e-04 \
 # --weight_decay=0.01 \
-# --output_dir="/fs/ess/PAS2136/bio_diffusion/ip-adapter_runs/bioclip/extra_context4" \
+# --output_dir="/fs/ess/PAS2136/bio_diffusion/ip-adapter_runs/bioclip/extra_context4_2gpus" \
 # --save_steps=2000 \
 # --report_to="wandb" \
 # --clip_extra_context_tokens=4 \
 
 ## context 1
 
-# accelerate launch --num_processes 4 --multi_gpu tutorial_train.py \
+# accelerate launch --num_processes 2 --multi_gpu tutorial_train.py \
 # --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
 # --image_encoder_path="/users/PAS2136/mridul/scratchpad/taxabind/IP-Adapter/models/image_encoder" \
 # --data_json_file="/fs/ess/PAS2136/bio_diffusion/data/inat/images/train_mini_birds.json" \
@@ -63,7 +63,7 @@ echo "Starting accelerate..."
 # --dataloader_num_workers=4 \
 # --learning_rate=1e-04 \
 # --weight_decay=0.01 \
-# --output_dir="/fs/ess/PAS2136/bio_diffusion/ip-adapter_runs/bioclip/extra_context1" \
+# --output_dir="/fs/ess/PAS2136/bio_diffusion/ip-adapter_runs/bioclip/extra_context1_2gpus" \
 # --save_steps=2000 \
 # --report_to="wandb" \
 # --clip_extra_context_tokens=1 \
@@ -71,19 +71,58 @@ echo "Starting accelerate..."
 ### no projection layer
 
 
-accelerate launch --num_processes 4 --multi_gpu tutorial_train.py \
+# accelerate launch --num_processes 2 --multi_gpu tutorial_train.py \
+# --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
+# --image_encoder_path="/users/PAS2136/mridul/scratchpad/taxabind/IP-Adapter/models/image_encoder" \
+# --data_json_file="/fs/ess/PAS2136/bio_diffusion/data/inat/images/train_mini_birds.json" \
+# --data_root_path="/fs/ess/PAS2136/bio_diffusion/data/inat/images" \
+# --mixed_precision="fp16" \
+# --resolution=512 \
+# --train_batch_size=64 \
+# --dataloader_num_workers=4 \
+# --learning_rate=1e-04 \
+# --weight_decay=0.01 \
+# --output_dir="/fs/ess/PAS2136/bio_diffusion/ip-adapter_runs/bioclip/no_projection_layer" \
+# --save_steps=2000 \
+# --report_to="wandb" \
+# --clip_extra_context_tokens=1 \
+# --no_projection_layer
+
+
+# ### location encoder
+
+# accelerate launch --num_processes 2 --multi_gpu tutorial_train.py \
+# --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
+# --image_encoder_path="/users/PAS2136/mridul/scratchpad/taxabind/IP-Adapter/models/image_encoder" \
+# --data_json_file="/fs/ess/PAS2136/bio_diffusion/data/inat/images/train_mini_birds_subset.json" \
+# --data_root_path="/fs/ess/PAS2136/bio_diffusion/data/inat/images" \
+# --mixed_precision="fp16" \
+# --resolution=512 \
+# --train_batch_size=64 \
+# --dataloader_num_workers=8 \
+# --learning_rate=1e-04 \
+# --weight_decay=0.01 \
+# --output_dir="/fs/ess/PAS2136/bio_diffusion/ip-adapter_runs/bioclip/location_2gpus" \
+# --save_steps=2000 \
+# --report_to="wandb" \
+# --clip_extra_context_tokens=4 \
+# --image_encoder='location'
+
+### taxabind encoder
+
+accelerate launch --num_processes 2 --multi_gpu tutorial_train.py \
 --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
 --image_encoder_path="/users/PAS2136/mridul/scratchpad/taxabind/IP-Adapter/models/image_encoder" \
---data_json_file="/fs/ess/PAS2136/bio_diffusion/data/inat/images/train_mini_birds.json" \
+--data_json_file="/fs/ess/PAS2136/bio_diffusion/data/inat/images/train_mini_birds_subset.json" \
 --data_root_path="/fs/ess/PAS2136/bio_diffusion/data/inat/images" \
 --mixed_precision="fp16" \
 --resolution=512 \
 --train_batch_size=64 \
---dataloader_num_workers=4 \
+--dataloader_num_workers=8 \
 --learning_rate=1e-04 \
 --weight_decay=0.01 \
---output_dir="/fs/ess/PAS2136/bio_diffusion/ip-adapter_runs/bioclip/extra_context1" \
+--output_dir="/fs/ess/PAS2136/bio_diffusion/ip-adapter_runs/bioclip/taxabind_2gpus" \
 --save_steps=2000 \
 --report_to="wandb" \
---clip_extra_context_tokens=1 \
---no_projection_layer
+--clip_extra_context_tokens=4 \
+--image_encoder='taxabind'

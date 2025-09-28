@@ -25,12 +25,14 @@ else:
     from ip_adapter.attention_processor import IPAttnProcessor, AttnProcessor
 
 import open_clip
+from transformers import PretrainedConfig
+from rshf.taxabind import TaxaBind
 
 
 # Dataset
 class MyDataset(torch.utils.data.Dataset):
 
-    def __init__(self, json_file, tokenizer, size=512, t_drop_rate=0.05, i_drop_rate=0.05, ti_drop_rate=0.05, image_root_path="", bioclip_tokenizer=None):
+    def __init__(self, json_file, tokenizer, size=512, t_drop_rate=0.05, i_drop_rate=0.05, ti_drop_rate=0.05, image_root_path="", bioclip_tokenizer=None,  taxabind_tokenizer=None):
         super().__init__()
 
         self.tokenizer = tokenizer
@@ -40,6 +42,7 @@ class MyDataset(torch.utils.data.Dataset):
         self.t_drop_rate = t_drop_rate
         self.ti_drop_rate = ti_drop_rate
         self.image_root_path = image_root_path
+        self.taxabind_tokenizer = taxabind_tokenizer
 
         self.data = json.load(open(json_file)) # list of dict: [{"image_file": "1.png", "text": "A dog"}]
 
@@ -56,7 +59,10 @@ class MyDataset(torch.utils.data.Dataset):
         text = item["text"]
         image_file = item["image_file"]
         taxonomic_name = item["taxonomic_name"]
-        
+        latitude = item['latitude']
+        longitude = item['longitude']
+        location = [latitude, longitude]
+
         # read image
         raw_image = Image.open(os.path.join(self.image_root_path, image_file))
         image = self.transform(raw_image.convert("RGB"))
@@ -82,13 +88,17 @@ class MyDataset(torch.utils.data.Dataset):
         ).input_ids
 
         taxa_tokenized = self.bioclip_tokenizer(taxonomic_name)
-        
+
+        taxabind_tokenized = self.taxabind_tokenizer(taxonomic_name)
+
         return {
             "image": image,
             "text_input_ids": text_input_ids,
             "clip_image": clip_image,
             "drop_image_embed": drop_image_embed,
-            "taxa_tokenized": taxa_tokenized
+            "taxa_tokenized": taxa_tokenized,
+            "location": torch.tensor(location),
+            "taxabind_tokenized": taxabind_tokenized
         }
 
     def __len__(self):
@@ -101,13 +111,17 @@ def collate_fn(data):
     taxa_tokenized = torch.cat([example["taxa_tokenized"] for example in data], dim=0)
     clip_images = torch.cat([example["clip_image"] for example in data], dim=0)
     drop_image_embeds = [example["drop_image_embed"] for example in data]
+    location = torch.stack([example["location"] for example in data], dim=0)
+    taxabind_tokenized = torch.cat([example["taxabind_tokenized"] for example in data], dim=0)
 
     return {
         "images": images,
         "text_input_ids": text_input_ids,
         "clip_images": clip_images,
         "drop_image_embeds": drop_image_embeds,
-        "taxa_tokenized": taxa_tokenized
+        "taxa_tokenized": taxa_tokenized,
+        "location": location,
+        "taxabind_tokenized": taxabind_tokenized
     }
     
 
@@ -278,7 +292,25 @@ def parse_args():
             "Disable projection layer when this flag is present"
         ),
     )
-    
+
+    parser.add_argument(
+        "--image_encoder_embeddings_dim",
+        type=int,
+        default=1024,
+        help=(
+            "The dimension of the CLIP Image Vision embeddings"
+        ),
+    )
+
+
+    parser.add_argument(
+        "--image_encoder",
+        type=str,
+        default="bioclip",
+        help=(
+            "The type of image encoder to use: clip or bioclip"
+        ),
+    )
 
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     
@@ -316,18 +348,43 @@ def main():
 
     bioclip, preprocess_train, preprocess_val = open_clip.create_model_and_transforms('hf-hub:imageomics/bioclip-2')
     bioclip_tokenizer = open_clip.get_tokenizer('hf-hub:imageomics/bioclip-2')
+
+    config = PretrainedConfig.from_pretrained("MVRL/taxabind-config")
+    taxabind = TaxaBind(config)
+    location_encoder = taxabind.get_location_encoder()
+    taxabind_image_text_model   = taxabind.get_image_text_encoder()  # open_clip model
+    taxabind_tokenizer = taxabind.get_tokenizer()   
+    
+
     # freeze parameters of models to save more memory
     unet.requires_grad_(False)
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     image_encoder.requires_grad_(False)
+    
     bioclip.requires_grad_(False)
+    location_encoder.requires_grad_(False).eval()
+    taxabind_image_text_model.requires_grad_(False).eval()
+
+    if args.image_encoder == "clip":
+        image_encoder_dim = image_encoder.config.projection_dim
+    elif args.image_encoder == "bioclip":
+        # image_encoder_dim = bioclip.text_projection.shape[1]
+        image_encoder_dim = 768
+    elif args.image_encoder == "taxabind":
+        # image_encoder_dim = location_encoder.config.hidden_size
+        image_encoder_dim = 512
+    elif args.image_encoder == "location":
+        # image_encoder_dim = location_encoder.config.hidden_size
+        image_encoder_dim = 512
+
+    print('Training the IP-Adapter with image encoder: ', args.image_encoder)
     
     #ip-adapter
     image_proj_model = ImageProjModel(
         cross_attention_dim=unet.config.cross_attention_dim,
         # clip_embeddings_dim=image_encoder.config.projection_dim, # TODO: change this for bioclip
-        clip_embeddings_dim=768,
+        clip_embeddings_dim=image_encoder_dim,
         clip_extra_context_tokens=args.clip_extra_context_tokens,
     )
     # init adapter modules
@@ -368,13 +425,15 @@ def main():
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     image_encoder.to(accelerator.device, dtype=weight_dtype)
     bioclip.to(accelerator.device, dtype=weight_dtype)
+    location_encoder.to(accelerator.device, dtype=torch.float32) # location encoder in fp32 as it is small
+    taxabind_image_text_model.to(accelerator.device, dtype=torch.float32)
     
     # optimizer
     params_to_opt = itertools.chain(ip_adapter.image_proj_model.parameters(),  ip_adapter.adapter_modules.parameters())
     optimizer = torch.optim.AdamW(params_to_opt, lr=args.learning_rate, weight_decay=args.weight_decay)
     
     # dataloader
-    train_dataset = MyDataset(args.data_json_file, tokenizer=tokenizer, size=args.resolution, image_root_path=args.data_root_path, bioclip_tokenizer=bioclip_tokenizer)
+    train_dataset = MyDataset(args.data_json_file, tokenizer=tokenizer, size=args.resolution, image_root_path=args.data_root_path, bioclip_tokenizer=bioclip_tokenizer, taxabind_tokenizer=taxabind_tokenizer)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
@@ -409,7 +468,17 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
             
                 with torch.no_grad():
-                    image_embeds = bioclip.encode_text(batch["taxa_tokenized"].to(accelerator.device)) # bioclip text encoder
+                    if args.image_encoder == "clip":
+                        image_embeds = image_encoder(batch["clip_images"].to(accelerator.device, dtype=weight_dtype)).image_embeds
+                    elif args.image_encoder == "bioclip":
+                        image_embeds = bioclip.encode_text(batch["taxa_tokenized"].to(accelerator.device))
+                    elif args.image_encoder == "location":
+                        image_embeds = location_encoder(batch["location"].to(accelerator.device))  
+                    elif args.image_encoder == "taxabind":
+                        image_embeds = taxabind_image_text_model.encode_text(batch["taxabind_tokenized"].to(accelerator.device))
+                        # image_embeds = taxabind_image_text_model.encode_image(batch["clip_images"].to(accelerator.device))
+
+                    # image_embeds = bioclip.encode_text(batch["taxa_tokenized"].to(accelerator.device)) # bioclip text encoder
                     # image_embeds = image_encoder(batch["clip_images"].to(accelerator.device, dtype=weight_dtype)).image_embeds
                 image_embeds_ = []
                 for image_embed, drop_image_embed in zip(image_embeds, batch["drop_image_embeds"]):
