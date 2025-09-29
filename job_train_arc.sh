@@ -187,29 +187,76 @@ accelerate launch --num_processes 4 --multi_gpu --main_process_port ${MASTER_POR
 --image_encoder_secondary='location' 
 
 
-
-
-
-
-
-
-#################### location adapter only runs
-accelerate launch --num_processes 4 --multi_gpu tutorial_train.py \
+############# extra extra context tokens to see
+accelerate launch --num_processes 4 --multi_gpu --main_process_port ${MASTER_PORT} tutorial_train_location.py \
 --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
---image_encoder_path="/home/mridul/IP-Adapter-fork/models/image_encoder" \
+--image_encoder_path="/home/medha/Projects/bio-diffusion/IP-Adapter-fork/models/image_encoder" \
 --data_json_file="/projects/ml4science/DATASETS/iNaturalist/train_mini_birds_subset_arc.json" \
 --data_root_path="/projects/ml4science/DATASETS/iNaturalist/images" \
 --mixed_precision="fp16" \
 --resolution=512 \
 --train_batch_size=64 \
---dataloader_num_workers=8 \
+--dataloader_num_workers=4 \
 --learning_rate=1e-04 \
 --weight_decay=0.01 \
---output_dir="/scratch/bio_diffusion/ip-adapter_runs/bioclip/location_only" \
+--output_dir="/scratch/bio_diffusion/ip-adapter_runs/bioclip/taxabind_location_context8_concat" \
+--save_steps=2000 \
+--report_to="wandb" \
+--clip_extra_context_tokens=8 \
+--image_encoder='taxabind' \
+--image_encoder_secondary='location' 
+
+python checkpoint_bin_change.py --base_ckpt_root "/scratch/bio_diffusion/ip-adapter_runs/bioclip/taxabind_location_context8_concat"
+
+python inference_location.py --ip_ckpt "/scratch/bio_diffusion/ip-adapter_runs/bioclip/taxabind_location_context8_concat" \
+--json_file "/projects/ml4science/DATASETS/iNaturalist/train_mini_birds_subset_arc.json" \
+--out_dir /scratch/bio_diffusion/ip-adapter_runs/samples/taxabind_location_context8_concat --num_samples 20 \
+--model_type taxabind --model_type_secondary location
+
+##### combined  bioclip + location single projection layer conct embeds adapter runs
+accelerate launch --num_processes 4 --multi_gpu --main_process_port ${MASTER_PORT} tutorial_train_location.py \
+--pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
+--image_encoder_path="/home/medha/Projects/bio-diffusion/IP-Adapter-fork/models/image_encoder" \
+--data_json_file="/projects/ml4science/DATASETS/iNaturalist/train_mini_birds_subset_arc.json" \
+--data_root_path="/projects/ml4science/DATASETS/iNaturalist/images" \
+--mixed_precision="fp16" \
+--resolution=512 \
+--train_batch_size=64 \
+--dataloader_num_workers=4 \
+--learning_rate=1e-04 \
+--weight_decay=0.01 \
+--output_dir="/scratch/bio_diffusion/ip-adapter_runs/bioclip/bioclip_location_context4_concat" \
 --save_steps=2000 \
 --report_to="wandb" \
 --clip_extra_context_tokens=4 \
---image_encoder='location'
+--image_encoder='bioclip' \
+--image_encoder_secondary='location' 
+
+python checkpoint_bin_change.py --base_ckpt_root "/scratch/bio_diffusion/ip-adapter_runs/bioclip/bioclip_location_context4_concat"
+
+python inference_location.py --ip_ckpt "/scratch/bio_diffusion/ip-adapter_runs/bioclip/bioclip_location_context4_concat" \
+--json_file "/projects/ml4science/DATASETS/iNaturalist/train_mini_birds_subset_arc.json" \
+--out_dir /scratch/bio_diffusion/ip-adapter_runs/samples/bioclip_location_context4_concat --num_samples 20 \
+--model_type bioclip --model_type_secondary location
+
+
+#################### location adapter only runs
+# accelerate launch --num_processes 4 --multi_gpu tutorial_train.py \
+# --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
+# --image_encoder_path="/home/mridul/IP-Adapter-fork/models/image_encoder" \
+# --data_json_file="/projects/ml4science/DATASETS/iNaturalist/train_mini_birds_subset_arc.json" \
+# --data_root_path="/projects/ml4science/DATASETS/iNaturalist/images" \
+# --mixed_precision="fp16" \
+# --resolution=512 \
+# --train_batch_size=64 \
+# --dataloader_num_workers=8 \
+# --learning_rate=1e-04 \
+# --weight_decay=0.01 \
+# --output_dir="/scratch/bio_diffusion/ip-adapter_runs/bioclip/location_only" \
+# --save_steps=2000 \
+# --report_to="wandb" \
+# --clip_extra_context_tokens=4 \
+# --image_encoder='location'
 
 
 
@@ -235,9 +282,9 @@ python inference.py --ip_ckpt "/scratch/bio_diffusion/ip-adapter_runs/bioclip/ex
 
 ########### Location + bioclip / taxabind evals
 
-python inference_location.py --ip_ckpt "/scratch/bio_diffusion/ip-adapter_runs/bioclip/taxabind_location_context4_concat/checkpoint-16000/ip_adapter.bin" \
+python inference_location.py --ip_ckpt "/scratch/bio_diffusion/ip-adapter_runs/bioclip/taxabind_location_context4_concat/checkpoint-28000/ip_adapter.bin" \
 --json_file "/projects/ml4science/DATASETS/iNaturalist/train_mini_birds_subset_arc.json" \
---out_dir /scratch/bio_diffusion/ip-adapter_runs/samples/taxabind_location_context4_concat --num_samples 20 \
+--out_dir /scratch/bio_diffusion/ip-adapter_runs/samples/taxabind_location_context4_concat_28kckpt --num_samples 20 \
 --model_type taxabind --model_type_secondary location
 
 python inference_location.py --ip_ckpt "/scratch/bio_diffusion/ip-adapter_runs/bioclip/bioclip_location_context4/checkpoint-22000/ip_adapter.bin" \

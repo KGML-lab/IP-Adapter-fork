@@ -1,64 +1,92 @@
-import os, sys, torch
+import os
+import sys
+import torch
+import argparse
 from safetensors.torch import load_file, save_file
 from diffusers import UNet2DConditionModel
 
-# --- EDIT THESE ---
-BASE_MODEL = "runwayml/stable-diffusion-v1-5"       # same base you trained with
-CKPT_DIR   = "/scratch/bio_diffusion/ip-adapter_runs/bioclip/bioclip_location_context4/checkpoint-22000/"
-IN_SFT     = os.path.join(CKPT_DIR, "model.safetensors")
-OUT_BIN    = os.path.join(CKPT_DIR, "ip_adapter.bin")
-OUT_SFT    = os.path.join(CKPT_DIR, "ip_adapter.safetensors")
-
-# --- Load saved weights ---
-sd = load_file(IN_SFT, device="cpu")
-
-# projector params live under image_proj_model.*
-image_proj_sd = {k.replace("image_proj_model.", "", 1): v
-                 for k, v in sd.items() if k.startswith("image_proj_model.")}
-print("projector param tensors:", len(image_proj_sd))  # expect 4 (proj/norm {weight,bias})
-
-image_proj2_sd = {k.replace("image_proj_model_secondary.", "", 1): v
-                 for k, v in sd.items() if k.startswith("image_proj_model_secondary.")}
-print("projector param tensors:", len(image_proj2_sd))  #
+# # --- EDIT THESE ---
+# BASE_MODEL = "runwayml/stable-diffusion-v1-5"       # same base you trained with
+# CKPT_DIR   = "/scratch/bio_diffusion/ip-adapter_runs/bioclip/taxabind_location_context4_concat/checkpoint-28000"
+# IN_SFT     = os.path.join(CKPT_DIR, "model.safetensors")
+# OUT_BIN    = os.path.join(CKPT_DIR, "ip_adapter.bin")
+# OUT_SFT    = os.path.join(CKPT_DIR, "ip_adapter.safetensors")
 
 
-# Build a reference UNet to get the exact attn processor order (so indices match)
-unet_ref = UNet2DConditionModel.from_pretrained(BASE_MODEL, subfolder="unet")
-names_ordered = list(unet_ref.attn_processors.keys())
-bases = [n[:-len(".processor")] if n.endswith(".processor") else n for n in names_ordered]
+def find_latest_checkpoint(base_dir):
+    ckpts = [d for d in os.listdir(base_dir) if d.startswith('checkpoint-')]
+    if not ckpts:
+        raise FileNotFoundError(f"No checkpoint-* directories found in {base_dir}")
+    ckpts = sorted(ckpts, key=lambda x: int(x.split('-')[-1]))
+    return os.path.join(base_dir, ckpts[-1])
 
-# IP weights are stored under: unet.<base>.processor.to_{k,v}_ip.weight
-ip_adapter_sd = {}
-missing_cnt = 0
-for idx, base in enumerate(bases):
-    k_key = f"unet.{base}.processor.to_k_ip.weight"
-    v_key = f"unet.{base}.processor.to_v_ip.weight"
-    if k_key in sd and v_key in sd:
-        ip_adapter_sd[f"{idx}.to_k_ip.weight"] = sd[k_key]
-        ip_adapter_sd[f"{idx}.to_v_ip.weight"] = sd[v_key]
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Convert checkpoint to bin/safetensors format.")
+    parser.add_argument('--ckpt_dir', type=str, default=None, help='Path to checkpoint dir (containing model.safetensors)')
+    parser.add_argument('--base_model', type=str, default="runwayml/stable-diffusion-v1-5", help='Base model name')
+    parser.add_argument('--base_ckpt_root', type=str, default="/scratch/bio_diffusion/ip-adapter_runs/bioclip/taxabind_location_context4_concat", help='Root dir to search for latest checkpoint if --ckpt_dir not given')
+    args = parser.parse_args()
+
+    BASE_MODEL = args.base_model
+    if args.ckpt_dir:
+        CKPT_DIR = args.ckpt_dir
     else:
-        # many attn1 (self-attn) layers don't have IP params — that's fine
-        missing_cnt += 1
+        CKPT_DIR = find_latest_checkpoint(args.base_ckpt_root)
+        print(f"Auto-selected latest checkpoint: {CKPT_DIR}")
+    IN_SFT = os.path.join(CKPT_DIR, "model.safetensors")
+    OUT_BIN = os.path.join(CKPT_DIR, "ip_adapter.bin")
+    OUT_SFT = os.path.join(CKPT_DIR, "ip_adapter.safetensors")
 
-print("ip-adapter param tensors:", len(ip_adapter_sd), "(layers without IP weights:", missing_cnt, ")")
-if not image_proj_sd or not ip_adapter_sd:
-    # help you debug prefixes quickly
-    print("\nExample keys containing 'processor' or 'image_proj_model':")
-    shown = 0
-    for k in sd.keys():
-        if "processor" in k or "image_proj_model" in k:
-            print("  ", k)
-            shown += 1
-            if shown >= 30: break
-    sys.exit("No params found; adjust prefixes or BASE_MODEL/CKPT_DIR.")
+    # --- Load saved weights ---
+    sd = load_file(IN_SFT, device="cpu")
 
-# --- Save nested .bin (your loader's non-safetensors path) ---
-torch.save({"image_proj": image_proj_sd, "image_proj2": image_proj2_sd, "ip_adapter": ip_adapter_sd}, OUT_BIN)
-print("Wrote", OUT_BIN)
+    # projector params live under image_proj_model.*
+    image_proj_sd = {k.replace("image_proj_model.", "", 1): v
+                     for k, v in sd.items() if k.startswith("image_proj_model.")}
+    print("projector param tensors:", len(image_proj_sd))  # expect 4 (proj/norm {weight,bias})
 
-# --- Also save flat .safetensors (your loader's safetensors path) ---
-flat = {f"image_proj.{k}": v for k, v in image_proj_sd.items()}
-flat.update({f"image_proj2.{k}": v for k, v in image_proj2_sd.items()})
-flat.update({f"ip_adapter.{k}": v for k, v in ip_adapter_sd.items()})
-save_file(flat, OUT_SFT)
-print("Wrote", OUT_SFT)
+    image_proj2_sd = {k.replace("image_proj_model_secondary.", "", 1): v
+                     for k, v in sd.items() if k.startswith("image_proj_model_secondary.")}
+    print("projector param tensors:", len(image_proj2_sd))  #
+
+    # Build a reference UNet to get the exact attn processor order (so indices match)
+    unet_ref = UNet2DConditionModel.from_pretrained(BASE_MODEL, subfolder="unet")
+    names_ordered = list(unet_ref.attn_processors.keys())
+    bases = [n[:-len(".processor")] if n.endswith(".processor") else n for n in names_ordered]
+
+    # IP weights are stored under: unet.<base>.processor.to_{k,v}_ip.weight
+    ip_adapter_sd = {}
+    missing_cnt = 0
+    for idx, base in enumerate(bases):
+        k_key = f"unet.{base}.processor.to_k_ip.weight"
+        v_key = f"unet.{base}.processor.to_v_ip.weight"
+        if k_key in sd and v_key in sd:
+            ip_adapter_sd[f"{idx}.to_k_ip.weight"] = sd[k_key]
+            ip_adapter_sd[f"{idx}.to_v_ip.weight"] = sd[v_key]
+        else:
+            # many attn1 (self-attn) layers don't have IP params — that's fine
+            missing_cnt += 1
+
+    print("ip-adapter param tensors:", len(ip_adapter_sd), "(layers without IP weights:", missing_cnt, ")")
+    if not image_proj_sd or not ip_adapter_sd:
+        # help you debug prefixes quickly
+        print("\nExample keys containing 'processor' or 'image_proj_model':")
+        shown = 0
+        for k in sd.keys():
+            if "processor" in k or "image_proj_model" in k:
+                print("  ", k)
+                shown += 1
+                if shown >= 30: break
+        sys.exit("No params found; adjust prefixes or BASE_MODEL/CKPT_DIR.")
+
+    # --- Save nested .bin (your loader's non-safetensors path) ---
+    torch.save({"image_proj": image_proj_sd, "image_proj2": image_proj2_sd, "ip_adapter": ip_adapter_sd}, OUT_BIN)
+    print("Wrote", OUT_BIN)
+
+    # --- Also save flat .safetensors (your loader's safetensors path) ---
+    flat = {f"image_proj.{k}": v for k, v in image_proj_sd.items()}
+    flat.update({f"image_proj2.{k}": v for k, v in image_proj2_sd.items()})
+    flat.update({f"ip_adapter.{k}": v for k, v in ip_adapter_sd.items()})
+    save_file(flat, OUT_SFT)
+    print("Wrote", OUT_SFT)

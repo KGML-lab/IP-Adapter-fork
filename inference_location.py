@@ -73,6 +73,31 @@ def class_dir_from_image_path(rel_path: str) -> str:
     """
     return os.path.basename(os.path.dirname(rel_path))
 
+def resolve_ckpt_path(path):
+    """
+    If path is a file, return it. If path is a directory, find the latest checkpoint subdir and return its ip_adapter.bin or ip_adapter.safetensors.
+    """
+    if os.path.isfile(path):
+        return path
+    if os.path.isdir(path):
+        # Look for checkpoint-* subdirs
+        ckpts = [d for d in os.listdir(path) if d.startswith('checkpoint-') and os.path.isdir(os.path.join(path, d))]
+        if not ckpts:
+            # Maybe this is already a checkpoint dir
+            for fname in ["ip_adapter.bin", "ip_adapter.safetensors"]:
+                fpath = os.path.join(path, fname)
+                if os.path.isfile(fpath):
+                    return fpath
+            raise FileNotFoundError(f"No checkpoint-* subdirs or ip_adapter files found in {path}")
+        ckpts = sorted(ckpts, key=lambda x: int(x.split('-')[-1]))
+        latest_ckpt = os.path.join(path, ckpts[-1])
+        for fname in ["ip_adapter.bin", "ip_adapter.safetensors"]:
+            fpath = os.path.join(latest_ckpt, fname)
+            if os.path.isfile(fpath):
+                return fpath
+        raise FileNotFoundError(f"No ip_adapter.bin or ip_adapter.safetensors found in latest checkpoint {latest_ckpt}")
+    raise FileNotFoundError(f"Path {path} does not exist")
+
 # ---------- CLI ----------
 
 def parse_args():
@@ -106,6 +131,9 @@ def parse_args():
 def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Resolve checkpoint path (file or directory)
+    ip_ckpt_path = resolve_ckpt_path(args.ip_ckpt)
 
     # 1) SD pipeline
     pipe = make_pipe(args.base_model, args.vae_model, device)
@@ -159,7 +187,7 @@ def main():
     ip_model = IPAdapter(
         pipe,
         image_encoder_path=image_encoder,   # pass the *instance*
-        ip_ckpt=args.ip_ckpt,
+        ip_ckpt=ip_ckpt_path,
         device=device,
         model_type=args.model_type,
         model_type_secondary=args.model_type_secondary,
