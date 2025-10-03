@@ -64,12 +64,16 @@ class MLPProjModel(torch.nn.Module):
 
 
 class IPAdapter:
-    def __init__(self, sd_pipe, image_encoder_path, ip_ckpt, device, num_tokens=4, model_type='clip'):
+    def __init__(self, sd_pipe, image_encoder_path, ip_ckpt, device, num_tokens=4, model_type='clip', bioclip=None, taxabind=None, location_encoder=None):
+
         self.device = device
         self.image_encoder_path = image_encoder_path
         self.ip_ckpt = ip_ckpt
         self.num_tokens = num_tokens
         self.model_type = model_type
+        self.bioclip = bioclip.to(self.device, dtype=torch.float16)
+        self.taxabind = taxabind.to(self.device, dtype=torch.float16)
+        self.location_encoder = location_encoder.to(self.device)
 
         self.pipe = sd_pipe.to(self.device)
         self.set_ip_adapter()
@@ -79,10 +83,12 @@ class IPAdapter:
             self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(self.image_encoder_path).to(
                 self.device, dtype=torch.float16
             )
-        elif model_type == 'bioclip' or  model_type == 'taxabind':
-            self.image_encoder = image_encoder_path.to(self.device, dtype=torch.float16)
+        elif model_type == 'bioclip':
+            self.image_encoder = self.bioclip
+        elif model_type == 'taxabind':
+            self.image_encoder = self.taxabind
         elif model_type == 'location':
-            self.image_encoder = image_encoder_path.to(self.device)
+            self.image_encoder = self.location_encoder
 
         self.clip_image_processor = CLIPImageProcessor()
         # image proj model

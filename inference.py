@@ -117,6 +117,11 @@ def main():
     taxabind_image_text_model   = taxabind.get_image_text_encoder().eval()  # open_clip model
     taxabind_tokenizer = taxabind.get_tokenizer()   
 
+    if args.model_type == "bioclip":
+        tokenizer = bioclip_tok
+    elif args.model_type == "taxabind":
+        tokenizer = taxabind_tokenizer
+
     # 3) Load JSON
     with open(args.json_file, "r") as f:
         items = json.load(f)
@@ -133,23 +138,17 @@ def main():
 
     print(f"Found {len(unique_items)} unique taxonomic names (from {len(items)} rows).")
 
-
-    if args.model_type =='bioclip':
-        image_encoder = bioclip_model
-        tokenizer = bioclip_tok
-    elif args.model_type =='taxabind':
-        image_encoder = taxabind_image_text_model
-        tokenizer = taxabind_tokenizer
-    elif args.model_type =='location':
-        image_encoder = location_encoder
     
     # 3) IP-Adapter wrapper (BioCLIP mode)
     ip_model = IPAdapter(
         pipe,
-        image_encoder_path=image_encoder,   # pass the *instance*
+        image_encoder_path=None,
         ip_ckpt=args.ip_ckpt,
         device=device,
         model_type=args.model_type,
+        bioclip=bioclip_model,
+        taxabind=taxabind_image_text_model,
+        location_encoder=location_encoder
     )
 
     # 4) Loop over entries and generate+save into per-class folder
