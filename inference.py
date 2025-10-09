@@ -87,13 +87,16 @@ def parse_args():
     # Generation params
     p.add_argument("--steps", type=int, default=50)
     p.add_argument("--guidance_scale", type=float, default=3.5, help="guidance scale")
+    p.add_argument("--scale", type=float, default=1.0, help="scale")
     p.add_argument("--num_samples", type=int, default=4, help="images per prompt")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out_dir", default="outputs_bioclip")
     p.add_argument("--num_tokens", type=int, default=4, help="must match training")
+    p.add_argument("--prompt", type=str, default=None, help="Prompt for image generation (optional).")
+    
 
     p.add_argument("--json_file", required=True, help="Path to JSON list of dicts.")
-    p.add_argument("--model_type", default="bioclip", choices=["bioclip", "taxabind", "location"], help="Which model type was used during IP-Adapter training?")
+    p.add_argument("--model_type", type=str, default="bioclip", choices=["bioclip", "taxabind", "location"], help="Which model type was used during IP-Adapter training?")
     return p.parse_args()
 
 
@@ -171,6 +174,8 @@ def main():
             num_inference_steps=args.steps,
             seed=args.seed,
             guidance_scale=args.guidance_scale,
+            prompt=args.prompt,
+            scale=args.scale,
         )
 
         # Save per-class
@@ -182,3 +187,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# python inference.py --ip_ckpt <path>/ip_adapter.bin --json_file <train_json> --out_dir /scratch/bio_diffusion/ip-adapter_runs/samples/<run> --num_samples 20 --model_type bioclip

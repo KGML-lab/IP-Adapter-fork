@@ -6,7 +6,7 @@ from diffusers import StableDiffusionPipeline
 from diffusers.pipelines.controlnet import MultiControlNetModel
 from PIL import Image
 from safetensors import safe_open
-from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
+from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, CLIPTextModelWithProjection
 
 from .utils import is_torch2_available, get_generator
 
@@ -64,7 +64,8 @@ class MLPProjModel(torch.nn.Module):
 
 
 class IPAdapter:
-    def __init__(self, sd_pipe, image_encoder_path, ip_ckpt, device, num_tokens=4, model_type='clip', bioclip=None, taxabind=None, location_encoder=None):
+    # def __init__(self, sd_pipe, image_encoder_path, ip_ckpt, device, num_tokens=4, model_type='clip', bioclip=None, taxabind=None, location_encoder=None, loc_proj_ckpt: Optional[str] = None):
+    def __init__(self, sd_pipe, image_encoder_path, ip_ckpt, device, num_tokens=4, model_type='image', bioclip=None, taxabind=None, location_encoder=None):
 
         self.device = device
         self.image_encoder_path = image_encoder_path
@@ -79,7 +80,7 @@ class IPAdapter:
         self.set_ip_adapter()
 
         # load image encoder
-        if model_type == 'clip':
+        if model_type == 'image':
             self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(self.image_encoder_path).to(
                 self.device, dtype=torch.float16
             )
@@ -97,7 +98,7 @@ class IPAdapter:
         self.load_ip_adapter()
 
     def init_proj(self):
-        if self.model_type == "clip":
+        if self.model_type == "image":
             image_encoder_dim = self.image_encoder.config.projection_dim
         elif self.model_type == "bioclip":
             # image_encoder_dim = bioclip.text_projection.shape[1]
@@ -163,7 +164,7 @@ class IPAdapter:
 
     @torch.inference_mode()
     def get_image_embeds(self, pil_image=None, clip_image_embeds=None):
-        if self.model_type == 'clip':
+        if self.model_type == 'image':
             if pil_image is not None:
                 if isinstance(pil_image, Image.Image):
                     pil_image = [pil_image]
