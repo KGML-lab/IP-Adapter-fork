@@ -456,10 +456,10 @@ def main():
     optimizer = torch.optim.AdamW(params_to_opt, lr=args.learning_rate, weight_decay=args.weight_decay)
     
     # dataloader
-    if args.image_encoder == "bioclip":
-        train_dataset = MyDataset(args.data_json_file, tokenizer=tokenizer, size=args.resolution, image_root_path=args.data_root_path, bioclip_tokenizer=bioclip_tokenizer, taxabind_tokenizer=taxabind_tokenizer)
-    elif args.image_encoder == "clip":
+    if args.image_encoder == "clip":
         train_dataset = MyDataset(args.data_json_file, tokenizer=tokenizer, size=args.resolution, image_root_path=args.data_root_path, bioclip_tokenizer=clip_text_with_proj_tokenizer, taxabind_tokenizer=taxabind_tokenizer, model_type="clip")
+    else:
+        train_dataset = MyDataset(args.data_json_file, tokenizer=tokenizer, size=args.resolution, image_root_path=args.data_root_path, bioclip_tokenizer=bioclip_tokenizer, taxabind_tokenizer=taxabind_tokenizer)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,

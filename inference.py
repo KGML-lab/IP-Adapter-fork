@@ -15,6 +15,7 @@ from rshf.taxabind import TaxaBind
 from ip_adapter import IPAdapter
 from tqdm import tqdm
 import json
+from transformers import CLIPTokenizer, CLIPTextModelWithProjection
 
 
 # ---------- Utilities ----------
@@ -59,9 +60,29 @@ def save_images(images: List[Image.Image], out_dir: str, grid_name: str = "grid.
     grid.save(os.path.join(out_dir, grid_name))
 
 def save_images_per_class(images, save_dir, class_tag):
+    """Save images for iNat dataset - original format."""
     os.makedirs(save_dir, exist_ok=True)
     for i, im in enumerate(images):
         im.save(os.path.join(save_dir, f"{class_tag}_sample{i:02d}.png"))
+
+
+def save_images_fishnet(images, save_dir, taxonomic_name, num_samples):
+    """Save images for FishNet dataset - uses taxonomic name with underscores.
+    
+    Args:
+        images: List of PIL images
+        save_dir: Directory to save images
+        taxonomic_name: Full taxonomic name (will be converted to filename)
+        num_samples: Number of samples being generated
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    base_filename = taxonomic_name.replace(" ", "_")
+    for i, im in enumerate(images):
+        if num_samples == 1:
+            filename = f"{base_filename}.png"
+        else:
+            filename = f"{base_filename}_sample_{i+1:03d}.png"
+        im.save(os.path.join(save_dir, filename))
 
 
 def class_dir_from_image_path(rel_path: str) -> str:
@@ -93,10 +114,12 @@ def parse_args():
     p.add_argument("--out_dir", default="outputs_bioclip")
     p.add_argument("--num_tokens", type=int, default=4, help="must match training")
     p.add_argument("--prompt", type=str, default=None, help="Prompt for image generation (optional).")
+    p.add_argument("--taxonomic_prompt", action="store_true", help="If set, use taxonomic name as prompt.")
     
 
     p.add_argument("--json_file", required=True, help="Path to JSON list of dicts.")
-    p.add_argument("--model_type", type=str, default="bioclip", choices=["bioclip", "taxabind", "location"], help="Which model type was used during IP-Adapter training?")
+    p.add_argument("--model_type", type=str, default="bioclip", choices=["bioclip", "taxabind", "location", "clip"], help="Which model type was used during IP-Adapter training?")
+    p.add_argument("--dataset", type=str, default="inat", choices=["inat", "fishnet"], help="Dataset type: 'inat' uses folder from image path, 'fishnet' uses taxonomic name")
     return p.parse_args()
 
 
@@ -124,6 +147,10 @@ def main():
         tokenizer = bioclip_tok
     elif args.model_type == "taxabind":
         tokenizer = taxabind_tokenizer
+    elif args.model_type == "clip":
+        clip_ckpt = "openai/clip-vit-large-patch14"   # matches SD 1.x
+        tokenizer  = CLIPTokenizer.from_pretrained(clip_ckpt)
+        clip_text_with_proj = CLIPTextModelWithProjection.from_pretrained(clip_ckpt).eval()
 
     # 3) Load JSON
     with open(args.json_file, "r") as f:
@@ -141,46 +168,88 @@ def main():
 
     print(f"Found {len(unique_items)} unique taxonomic names (from {len(items)} rows).")
 
-    
-    # 3) IP-Adapter wrapper (BioCLIP mode)
-    ip_model = IPAdapter(
-        pipe,
-        image_encoder_path=None,
-        ip_ckpt=args.ip_ckpt,
-        device=device,
-        model_type=args.model_type,
-        bioclip=bioclip_model,
-        taxabind=taxabind_image_text_model,
-        location_encoder=location_encoder
-    )
+
+    # 3) IP-Adapter wrapper 
+    if args.model_type == "clip":
+        print("Using CLIP model for IP-Adapter...")
+        ip_model = IPAdapter(
+            pipe,
+            image_encoder_path=None,
+            ip_ckpt=args.ip_ckpt,
+            device=device,
+            model_type=args.model_type,
+            bioclip=clip_text_with_proj,
+            taxabind=taxabind_image_text_model,
+            location_encoder=location_encoder
+        )
+    else:
+        ip_model = IPAdapter(
+            pipe,
+            image_encoder_path=None,
+            ip_ckpt=args.ip_ckpt,
+            device=device,
+            model_type=args.model_type,
+            bioclip=bioclip_model,
+            taxabind=taxabind_image_text_model,
+            location_encoder=location_encoder
+        )
 
     # 4) Loop over entries and generate+save into per-class folder
+    # breakpoint()
     for idx, entry in tqdm(enumerate(unique_items, start=1), total=len(unique_items)):
         taxa_name = entry["taxonomic_name"]
-        rel_img_path = entry["image_file"]  # not used for conditioning; used to name the class dir
         location = torch.tensor([entry["latitude"], entry["longitude"]])
-        class_dir = class_dir_from_image_path(rel_img_path)
-        save_dir = os.path.join(args.out_dir, class_dir)
+        
+        # Determine folder and save strategy based on dataset type
+        if args.dataset == "fishnet":
+            # For FishNet: use taxonomic_name with spaces replaced by underscores as folder
+            folder_name = taxa_name.replace(" ", "_")
+            folder_name = folder_name.replace("/", "-")
+            save_dir = os.path.join(args.out_dir, folder_name)
+        else:
+            # For iNat: use folder from image path (original behavior)
+            rel_img_path = entry["image_file"]
+            class_dir = class_dir_from_image_path(rel_img_path)
+            save_dir = os.path.join(args.out_dir, class_dir)
 
         if args.model_type == "bioclip" or args.model_type == "taxabind":
             tokens = tokenizer(taxa_name).to(device)
         elif args.model_type == "location":
             tokens = location.unsqueeze(0).to(device)
+        elif args.model_type == "clip":
+            tokens = tokenizer(
+                taxa_name,
+                max_length=tokenizer.model_max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            ).input_ids
+            tokens = tokens.to(device)
 
-        # Generate (NOTE: call with bioclip_tokens; do NOT pass tokens to pil_image)
+        # Generate images
+        if args.taxonomic_prompt:
+            prompt = 'best quality, high quality photo of ' + taxa_name
+        else:
+            prompt = args.prompt
         images = ip_model.generate(
             pil_image=tokens,
             num_samples=args.num_samples,
             num_inference_steps=args.steps,
             seed=args.seed,
             guidance_scale=args.guidance_scale,
-            prompt=args.prompt,
+            prompt=prompt,
             scale=args.scale,
         )
 
-        # Save per-class
-        save_images_per_class(images, save_dir, class_tag=class_dir)
-        print(f"[{idx+1}/{len(items)}] Saved {len(images)} images -> {save_dir}")
+        # Save images using appropriate function
+        if args.dataset == "fishnet":
+            taxa_name = taxa_name.replace("/", "-")
+            save_images_fishnet(images, save_dir, taxa_name, args.num_samples)
+        else:
+            save_images_per_class(images, save_dir, class_dir)
+        
+        # print(f"[{idx}/{len(unique_items[:20])}] {taxa_name}")
+        print(f"    Saved {len(images)} images -> {save_dir}")
 
     print("Done.")
 

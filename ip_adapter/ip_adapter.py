@@ -84,7 +84,7 @@ class IPAdapter:
             self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(self.image_encoder_path).to(
                 self.device, dtype=torch.float16
             )
-        elif model_type == 'bioclip':
+        elif model_type == 'bioclip' or model_type == 'clip':
             self.image_encoder = self.bioclip
         elif model_type == 'taxabind':
             self.image_encoder = self.taxabind
@@ -98,7 +98,7 @@ class IPAdapter:
         self.load_ip_adapter()
 
     def init_proj(self):
-        if self.model_type == "image":
+        if self.model_type == "image" or self.model_type == "clip":
             image_encoder_dim = self.image_encoder.config.projection_dim
         elif self.model_type == "bioclip":
             # image_encoder_dim = bioclip.text_projection.shape[1]
@@ -187,6 +187,10 @@ class IPAdapter:
             location_emb = self.image_encoder(pil_image).to(dtype=torch.float16)
             image_prompt_embeds = self.image_proj_model(location_emb)
             uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(location_emb))
+        elif self.model_type == 'clip':
+            text_emb = self.image_encoder(pil_image)[0]
+            image_prompt_embeds = self.image_proj_model(text_emb)
+            uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(text_emb))
 
 
         return image_prompt_embeds, uncond_image_prompt_embeds
