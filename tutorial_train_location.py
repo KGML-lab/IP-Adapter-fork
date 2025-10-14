@@ -15,7 +15,7 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection, CLIPTextModelWithProjection
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
 
 from ip_adapter.ip_adapter import ImageProjModel
 from ip_adapter.utils import is_torch2_available
@@ -32,7 +32,7 @@ from rshf.taxabind import TaxaBind
 # Dataset
 class MyDataset(torch.utils.data.Dataset):
 
-    def __init__(self, json_file, tokenizer, size=512, t_drop_rate=0.05, i_drop_rate=0.05, ti_drop_rate=0.05, image_root_path="", bioclip_tokenizer=None,  taxabind_tokenizer=None, model_type="bioclip"):
+    def __init__(self, json_file, tokenizer, size=512, t_drop_rate=0.05, i_drop_rate=0.05, ti_drop_rate=0.05, image_root_path="", bioclip_tokenizer=None,  taxabind_tokenizer=None):
         super().__init__()
 
         self.tokenizer = tokenizer
@@ -43,7 +43,6 @@ class MyDataset(torch.utils.data.Dataset):
         self.ti_drop_rate = ti_drop_rate
         self.image_root_path = image_root_path
         self.taxabind_tokenizer = taxabind_tokenizer
-        self.model_type = model_type
 
         self.data = json.load(open(json_file)) # list of dict: [{"image_file": "1.png", "text": "A dog"}]
 
@@ -88,16 +87,7 @@ class MyDataset(torch.utils.data.Dataset):
             return_tensors="pt"
         ).input_ids
 
-        if self.model_type == "bioclip":
-            taxa_tokenized = self.bioclip_tokenizer(taxonomic_name)
-        elif self.model_type == "clip":
-            taxa_tokenized = self.bioclip_tokenizer(
-                taxonomic_name,
-                max_length=self.tokenizer.model_max_length,
-                padding="max_length",
-                truncation=True,
-                return_tensors="pt"
-            ).input_ids
+        taxa_tokenized = self.bioclip_tokenizer(taxonomic_name)
 
         taxabind_tokenized = self.taxabind_tokenizer(taxonomic_name)
 
@@ -137,21 +127,33 @@ def collate_fn(data):
 
 class IPAdapter(torch.nn.Module):
     """IP-Adapter"""
-    def __init__(self, unet, image_proj_model, adapter_modules, ckpt_path=None):
+    def __init__(self, unet, image_proj_model, adapter_modules, ckpt_path=None, image_proj_model_secondary=None):
         super().__init__()
         self.unet = unet
         self.image_proj_model = image_proj_model
         self.adapter_modules = adapter_modules
+        self.image_proj_model_secondary = image_proj_model_secondary
 
         if ckpt_path is not None:
             self.load_from_checkpoint(ckpt_path)
 
-    def forward(self, noisy_latents, timesteps, encoder_hidden_states, image_embeds, projection_flag=True):
+    def forward(self, noisy_latents, timesteps, encoder_hidden_states, image_embeds, projection_flag=True, image_embeds2=None):
+        # print("projection_flag: ", projection_flag)
+        # print("in IPAdapter forward, image_embeds shape: ", image_embeds.shape)
         if not projection_flag:
+            # print("############################bypassing projection layer...",flush=True)
             ip_tokens = image_embeds.unsqueeze(1) # [B, 1, 768]
+            encoder_hidden_states = torch.cat([encoder_hidden_states, ip_tokens], dim=1)
         else:
+            # print("############################projecting image embeddings...",flush=True)
             ip_tokens = self.image_proj_model(image_embeds) # [B, 4, 768]
-        encoder_hidden_states = torch.cat([encoder_hidden_states, ip_tokens], dim=1) # [B, 81, 768]
+            # concatenate ip tokens with text encoder hidden states
+            encoder_hidden_states = torch.cat([encoder_hidden_states, ip_tokens], dim=1) # [B, 81, 768]
+            if self.image_proj_model_secondary is not None and image_embeds2 is not None:
+                # print("############################projecting secondary image embeddings...",flush=True)
+                ip_tokens2 = self.image_proj_model_secondary(image_embeds2) # [B, 4, 768]
+                # concatenate ip tokens with text encoder hidden states
+                encoder_hidden_states = torch.cat([encoder_hidden_states, ip_tokens2], dim=1) # [B, 81, 768]
         # Predict the noise residual
         noise_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
         return noise_pred
@@ -322,6 +324,20 @@ def parse_args():
         ),
     )
 
+    parser.add_argument(
+        "--image_encoder_secondary",
+        type=str,
+        default="bioclip",
+        help=(
+            "The type of image encoder to use: clip or bioclip"
+        ),
+    )
+
+    parser.add_argument("--image_proj_secondary", 
+                        action="store_true", 
+                        default=False, 
+                        help="Use a separate projection layer for the secondary image encoder")   
+
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     
     args = parser.parse_args()
@@ -364,11 +380,6 @@ def main():
     location_encoder = taxabind.get_location_encoder()
     taxabind_image_text_model   = taxabind.get_image_text_encoder()  # open_clip model
     taxabind_tokenizer = taxabind.get_tokenizer()   
-
-    if args.image_encoder == "clip":
-        clip_ckpt = "openai/clip-vit-large-patch14"   # matches SD 1.x
-        clip_text_with_proj_tokenizer  = CLIPTokenizer.from_pretrained(clip_ckpt)
-        clip_text_with_proj = CLIPTextModelWithProjection.from_pretrained(clip_ckpt).eval()
     
 
     # freeze parameters of models to save more memory
@@ -380,11 +391,8 @@ def main():
     bioclip.requires_grad_(False)
     location_encoder.requires_grad_(False).eval()
     taxabind_image_text_model.requires_grad_(False).eval()
+
     if args.image_encoder == "clip":
-        clip_text_with_proj.requires_grad_(False)
-
-
-    if args.image_encoder == "image":
         image_encoder_dim = image_encoder.config.projection_dim
     elif args.image_encoder == "bioclip":
         # image_encoder_dim = bioclip.text_projection.shape[1]
@@ -395,10 +403,34 @@ def main():
     elif args.image_encoder == "location":
         # image_encoder_dim = location_encoder.config.hidden_size
         image_encoder_dim = 512
-    elif args.image_encoder == "clip":
-        image_encoder_dim = clip_text_with_proj.config.projection_dim
 
     print('Training the IP-Adapter with image encoder: ', args.image_encoder)
+
+    if args.image_encoder_secondary != args.image_encoder:
+        print('Also using secondary image encoder: ', args.image_encoder_secondary)
+        if args.image_encoder_secondary == "clip":
+            if args.image_proj_secondary:
+                image_encoder2_dim = args.image_encoder_embeddings_dim
+            else:
+                image_encoder_dim += image_encoder.config.projection_dim
+        elif args.image_encoder_secondary == "bioclip":
+            # image_encoder_dim += bioclip.text_projection.shape[1]
+            if args.image_proj_secondary:
+                image_encoder2_dim = 768
+            else:
+                image_encoder_dim += 768 
+        elif args.image_encoder_secondary == "taxabind":
+            # image_encoder_dim += location_encoder.config.hidden_size
+            if args.image_proj_secondary:   
+                image_encoder2_dim = 512
+            else:
+                image_encoder_dim += 512
+        elif args.image_encoder_secondary == "location":
+            # image_encoder_dim += location_encoder.config.hidden_size
+            if args.image_proj_secondary:
+                image_encoder2_dim = 512
+            else:
+                image_encoder_dim += 512
     
     #ip-adapter
     image_proj_model = ImageProjModel(
@@ -407,6 +439,14 @@ def main():
         clip_embeddings_dim=image_encoder_dim,
         clip_extra_context_tokens=args.clip_extra_context_tokens,
     )
+    if args.image_encoder_secondary != args.image_encoder and args.image_proj_secondary:
+        image_proj_model2 = ImageProjModel(
+            cross_attention_dim=unet.config.cross_attention_dim,
+            # clip_embeddings_dim=image_encoder.config.projection_dim, # TODO: change this for bioclip
+            clip_embeddings_dim=image_encoder2_dim,
+            clip_extra_context_tokens=args.clip_extra_context_tokens,
+        )
+
     # init adapter modules
     attn_procs = {}
     unet_sd = unet.state_dict()
@@ -433,7 +473,12 @@ def main():
     unet.set_attn_processor(attn_procs)
     adapter_modules = torch.nn.ModuleList(unet.attn_processors.values())
     
-    ip_adapter = IPAdapter(unet, image_proj_model, adapter_modules, args.pretrained_ip_adapter_path)
+    if args.image_encoder_secondary != args.image_encoder and args.image_proj_secondary:
+        # two projection layers
+        ip_adapter = IPAdapter(unet, image_proj_model, adapter_modules, args.pretrained_ip_adapter_path, image_proj_model_secondary=image_proj_model2)
+    else:
+        # single projection layer
+        ip_adapter = IPAdapter(unet, image_proj_model, adapter_modules, args.pretrained_ip_adapter_path)
     
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -444,22 +489,22 @@ def main():
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     image_encoder.to(accelerator.device, dtype=weight_dtype)
+    # if args.image_encoder_secondary != args.image_encoder:
+    #     imgage_encoder_secondary.to(accelerator.device, dtype=weight_dtype)
     bioclip.to(accelerator.device, dtype=weight_dtype)
     location_encoder.to(accelerator.device, dtype=torch.float32) # location encoder in fp32 as it is small
     taxabind_image_text_model.to(accelerator.device, dtype=torch.float32)
-
-    if args.image_encoder == "clip":
-        clip_text_with_proj.to(accelerator.device, dtype=weight_dtype)
     
     # optimizer
-    params_to_opt = itertools.chain(ip_adapter.image_proj_model.parameters(),  ip_adapter.adapter_modules.parameters())
+    if args.image_encoder_secondary != args.image_encoder and args.image_proj_secondary:
+        params_to_opt = itertools.chain(ip_adapter.image_proj_model.parameters(), ip_adapter.image_proj_model_secondary.parameters(),  
+                                        ip_adapter.adapter_modules.parameters())
+    else:
+        params_to_opt = itertools.chain(ip_adapter.image_proj_model.parameters(),  ip_adapter.adapter_modules.parameters())
     optimizer = torch.optim.AdamW(params_to_opt, lr=args.learning_rate, weight_decay=args.weight_decay)
     
     # dataloader
-    if args.image_encoder == "clip":
-        train_dataset = MyDataset(args.data_json_file, tokenizer=tokenizer, size=args.resolution, image_root_path=args.data_root_path, bioclip_tokenizer=clip_text_with_proj_tokenizer, taxabind_tokenizer=taxabind_tokenizer, model_type="clip")
-    else:
-        train_dataset = MyDataset(args.data_json_file, tokenizer=tokenizer, size=args.resolution, image_root_path=args.data_root_path, bioclip_tokenizer=bioclip_tokenizer, taxabind_tokenizer=taxabind_tokenizer)
+    train_dataset = MyDataset(args.data_json_file, tokenizer=tokenizer, size=args.resolution, image_root_path=args.data_root_path, bioclip_tokenizer=bioclip_tokenizer, taxabind_tokenizer=taxabind_tokenizer)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
@@ -494,7 +539,7 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
             
                 with torch.no_grad():
-                    if args.image_encoder == "image":
+                    if args.image_encoder == "clip":
                         image_embeds = image_encoder(batch["clip_images"].to(accelerator.device, dtype=weight_dtype)).image_embeds
                     elif args.image_encoder == "bioclip":
                         image_embeds = bioclip.encode_text(batch["taxa_tokenized"].to(accelerator.device))
@@ -502,21 +547,49 @@ def main():
                         image_embeds = location_encoder(batch["location"].to(accelerator.device))  
                     elif args.image_encoder == "taxabind":
                         image_embeds = taxabind_image_text_model.encode_text(batch["taxabind_tokenized"].to(accelerator.device))
-                    elif args.image_encoder == "clip":
-                        image_embeds = clip_text_with_proj(batch["taxa_tokenized"].to(accelerator.device))[0]
-
+                        # image_embeds = taxabind_image_text_model.encode_image(batch["clip_images"].to(accelerator.device))
+                    image_embeds2 = None
+                    if args.image_encoder_secondary != args.image_encoder:
+                        if args.image_encoder_secondary == "clip":
+                            # image_embeds2 = image_encoder(batch["clip_images"].to(accelerator.device, dtype=weight_dtype)).image_embeds
+                            image_embeds2 = image_encoder(batch["clip_images"].to(accelerator.device, dtype=weight_dtype)).image_embeds
+                        elif args.image_encoder_secondary == "bioclip":
+                            image_embeds2 = bioclip.encode_text(batch["taxa_tokenized"].to(accelerator.device))
+                        elif args.image_encoder_secondary == "location":
+                            image_embeds2 = location_encoder(batch["location"].to(accelerator.device))  
+                        elif args.image_encoder_secondary == "taxabind":
+                            image_embeds2 = taxabind_image_text_model.encode_text(batch["taxabind_tokenized"].to(accelerator.device))
+                            # image_embeds2 = taxabind_image_text_model.encode_image(batch["clip_images"].to(accelerator.device))
+                        #
+                    # image_embeds = bioclip.encode_text(batch["taxa_tokenized"].to(accelerator.device)) # bioclip text encoder
+                    # image_embeds = image_encoder(batch["clip_images"].to(accelerator.device, dtype=weight_dtype)).image_embeds
                 image_embeds_ = []
-                for image_embed, drop_image_embed in zip(image_embeds, batch["drop_image_embeds"]):
+                image_embeds2_ = []
+                if image_embeds2 is None:
+                    image_embeds2 = image_embeds
+                for image_embed, image_embed2, drop_image_embed in zip(image_embeds, image_embeds2, batch["drop_image_embeds"]):
                     if drop_image_embed == 1:
                         image_embeds_.append(torch.zeros_like(image_embed))
+                        image_embeds2_.append(torch.zeros_like(image_embed2))
                     else:
                         image_embeds_.append(image_embed)
+                        image_embeds2_.append(image_embed2)
                 image_embeds = torch.stack(image_embeds_)
+                image_embeds2 = torch.stack(image_embeds2_)
             
                 with torch.no_grad():
                     encoder_hidden_states = text_encoder(batch["text_input_ids"].to(accelerator.device))[0]
                 
-                noise_pred = ip_adapter(noisy_latents, timesteps, encoder_hidden_states, image_embeds, projection_flag=args.no_projection_layer)
+                if args.image_encoder_secondary != args.image_encoder and args.image_proj_secondary:
+                    # print("############################using two projection layers...",flush=True)
+                    noise_pred = ip_adapter(noisy_latents, timesteps, encoder_hidden_states, image_embeds, projection_flag=args.no_projection_layer, image_embeds2=image_embeds2)
+                elif args.image_encoder_secondary != args.image_encoder and not args.image_proj_secondary:
+                    # no secondary project, concat the two image embeddings and send together
+                    # print("############################concatenating image embeddings...",flush=True)
+                    image_embeds_cat = torch.cat([image_embeds, image_embeds2], dim=1)
+                    noise_pred = ip_adapter(noisy_latents, timesteps, encoder_hidden_states, image_embeds_cat, projection_flag=args.no_projection_layer)
+                else:
+                    noise_pred = ip_adapter(noisy_latents, timesteps, encoder_hidden_states, image_embeds, projection_flag=args.no_projection_layer)
         
                 loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
             
@@ -537,6 +610,8 @@ def main():
             if global_step % args.save_steps == 0:
                 save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                 accelerator.save_state(save_path)
+                ip_state = accelerator.get_state_dict(ip_adapter)
+                torch.save(ip_state, os.path.join(save_path, "ip_adapter_full.bin"))
             
             begin = time.perf_counter()
                 
