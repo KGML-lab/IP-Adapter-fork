@@ -572,24 +572,35 @@ def main():
             print("Gradient checkpointing enabled for UNet")
     
     # Enable torch.compile() for faster training (PyTorch 2.0+)
-    # This provides 30-50% speedup with minimal overhead
-    # For PyTorch 2.3.1: excellent compile support with reduce-overhead mode
-    if not args.disable_torch_compile and hasattr(torch, 'compile') and torch.__version__ >= "2.0.0":
+    # NOTE: Disabled for Python 3.12+ (torch.compile not supported in PyTorch 2.3.1)
+    # To enable: Use Python 3.11 or earlier
+    import sys
+    python_version = sys.version_info
+    can_use_compile = (not args.disable_torch_compile and 
+                       hasattr(torch, 'compile') and 
+                       torch.__version__ >= "2.0.0" and
+                       python_version < (3, 12))
+    
+    if can_use_compile:
         if rank == 0:
-            print(f"PyTorch {torch.__version__} detected. Compiling UNet with torch.compile()...")
+            print(f"PyTorch {torch.__version__} with Python {python_version.major}.{python_version.minor} detected.")
+            print("Compiling UNet with torch.compile()...")
             print("Note: First iteration will be slower (~30-60s) due to compilation, then much faster!")
-            print("To disable: add --disable_torch_compile flag")
         
-        # PyTorch 2.3.1 supports these modes:
-        # - "reduce-overhead": Best for training (optimizes memory and speed)
-        # - "max-autotune": Slower compile but potentially faster training
-        # - "default": Balanced
         ip_adapter.unet = torch.compile(ip_adapter.unet, mode="reduce-overhead")
         
         if rank == 0:
             print("✓ UNet compiled successfully! Training will be 30-50% faster after first iteration.")
-    elif args.disable_torch_compile and rank == 0:
-        print("torch.compile() disabled via --disable_torch_compile flag")
+    else:
+        if rank == 0:
+            if args.disable_torch_compile:
+                print("torch.compile() disabled via --disable_torch_compile flag")
+            elif python_version >= (3, 12):
+                print(f"⚠ torch.compile() not available: Python {python_version.major}.{python_version.minor} detected")
+                print(f"  PyTorch 2.3.1 requires Python < 3.12 for torch.compile()")
+                print(f"  Training will continue without compilation")
+            elif not hasattr(torch, 'compile'):
+                print("torch.compile() not available in this PyTorch version")
     
     # Determine weight dtype
     weight_dtype = torch.float32
@@ -603,8 +614,10 @@ def main():
     vae.to(device, dtype=weight_dtype)
     text_encoder.to(device, dtype=weight_dtype)
     image_encoder.to(device, dtype=weight_dtype)
+    
+    # bioclip.to(device, dtype=torch.float32)
     bioclip.to(device, dtype=weight_dtype)
-    location_encoder.to(device, dtype=torch.float32) # location encoder in fp32 as it is small
+    location_encoder.to(device, dtype=torch.float32)
     taxabind_image_text_model.to(device, dtype=torch.float32)
 
     if args.image_encoder == "clip":
@@ -660,9 +673,26 @@ def main():
     # if rank == 0:
     #     print(f"LR Scheduler: {args.lr_scheduler}, Warmup steps: {args.lr_warmup_steps}, Total steps: {total_steps}")
     
-    # Setup GradScaler for mixed precision (only for fp16, not bf16)
-    # PyTorch 2.3.1 compatibility: explicitly set enabled=True
-    scaler = GradScaler(enabled=True) if args.mixed_precision == "fp16" else None
+    # Setup GradScaler for mixed precision
+    # CRITICAL: GradScaler is ONLY for FP16, NOT for BF16 or FP32
+    # BF16 has same range as FP32 and doesn't need gradient scaling
+    if args.mixed_precision == "fp16":
+        scaler = GradScaler()
+        if rank == 0:
+            print("✓ Using GradScaler for FP16 training")
+    else:
+        scaler = None
+        if rank == 0:
+            if args.mixed_precision == "bf16":
+                print("✓ BF16 training (no GradScaler needed - BF16 is numerically stable)")
+            elif args.mixed_precision == "no":
+                print("✓ FP32 training (no mixed precision)")
+            else:
+                print(f"✓ Mixed precision: {args.mixed_precision} (no GradScaler)")
+    
+    # Verify scaler state
+    if rank == 0:
+        print(f"  GradScaler status: {'ENABLED' if scaler is not None else 'DISABLED'}")
     
     # Determine autocast dtype
     if args.mixed_precision == "fp16":
@@ -813,18 +843,33 @@ def main():
                 else:
                     image_embeds_.append(image_embed)
             image_embeds = torch.stack(image_embeds_)
+
+            # breakpoint()
+            # # Convert image embeddings to weight_dtype for compatibility with UNet
+            # # This is safe: FP32 embeddings → FP16/BF16 for inference (no gradient)
+            # image_embeds = image_embeds.to(dtype=weight_dtype)
         
+            # Get text encoder hidden states (with mixed precision)
             with torch.no_grad():
                 encoder_hidden_states = text_encoder(batch["text_input_ids"].to(device))[0]
             
             # Forward pass with mixed precision
-            # Note: PyTorch < 2.4 doesn't support device_type parameter, so we use torch.cuda.amp.autocast directly
+            # Now all inputs (noisy_latents, encoder_hidden_states, image_embeds) are in weight_dtype
+            breakpoint()
             with torch.cuda.amp.autocast(enabled=(args.mixed_precision != "no"), dtype=autocast_dtype):
                 noise_pred = ip_adapter(noisy_latents, timesteps, encoder_hidden_states, image_embeds, projection_flag=args.no_projection_layer)
                 loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
             
             # Backward pass with gradient clipping
             # Clips gradients for BOTH image_proj_model AND adapter_modules (decoupled cross-attention)
+            
+            # Safety check: scaler should only exist for FP16
+            if scaler is not None and args.mixed_precision != "fp16":
+                raise RuntimeError(
+                    f"ERROR: GradScaler exists but mixed_precision={args.mixed_precision}. "
+                    f"GradScaler should ONLY be used with FP16, not BF16 or FP32!"
+                )
+            
             if scaler is not None:
                 # FP16 training with GradScaler
                 scaler.scale(loss).backward()
@@ -875,11 +920,11 @@ def main():
                 }
                 progress_bar.set_postfix(**logs)
                 
-                # Periodic detailed logging (every 10 steps)
-                if step % 10 == 0:
-                    print(f"\nEpoch {epoch}, step {step}/{len(train_dataloader)}, "
-                          f"data_time: {load_data_time:.4f}s, step_time: {step_time:.4f}s, "
-                          f"loss: {avg_loss:.6f}, lr: {optimizer.param_groups[0]['lr']:.2e}")
+                # # Periodic detailed logging (every 10 steps)
+                # if step % 100 == 0:
+                #     print(f"\nEpoch {epoch}, step {step}/{len(train_dataloader)}, "
+                #           f"data_time: {load_data_time:.4f}s, step_time: {step_time:.4f}s, "
+                #           f"loss: {avg_loss:.6f}, lr: {optimizer.param_groups[0]['lr']:.2e}")
                 
                 # Log to tensorboard/wandb
                 if logger is not None:
