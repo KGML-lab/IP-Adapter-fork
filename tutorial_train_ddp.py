@@ -153,6 +153,8 @@ class IPAdapter(torch.nn.Module):
             ip_tokens = image_embeds.unsqueeze(1) # [B, 1, 768]
         else:
             ip_tokens = self.image_proj_model(image_embeds) # [B, 4, 768]
+        # ip_tokens from FP32 params, cast to match encoder_hidden_states (weight_dtype)
+        ip_tokens = ip_tokens.to(dtype=encoder_hidden_states.dtype)
         encoder_hidden_states = torch.cat([encoder_hidden_states, ip_tokens], dim=1) # [B, 81, 768]
         # Predict the noise residual
         noise_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
@@ -610,12 +612,12 @@ def main():
         weight_dtype = torch.bfloat16
     
     # Move models to device
+    # Strategy: Keep frozen inference models in weight_dtype for speed
+    #           Keep trainable models (ip_adapter) in FP32 for GradScaler compatibility
     unet.to(device, dtype=weight_dtype)
     vae.to(device, dtype=weight_dtype)
     text_encoder.to(device, dtype=weight_dtype)
     image_encoder.to(device, dtype=weight_dtype)
-    
-    # bioclip.to(device, dtype=torch.float32)
     bioclip.to(device, dtype=weight_dtype)
     location_encoder.to(device, dtype=torch.float32)
     taxabind_image_text_model.to(device, dtype=torch.float32)
@@ -623,8 +625,9 @@ def main():
     if args.image_encoder == "clip":
         clip_text_with_proj.to(device, dtype=weight_dtype)
     
-    # Move ip_adapter to device and wrap with DDP
-    ip_adapter = ip_adapter.to(device)
+    # Move ip_adapter to device but keep trainable params in FP32
+    # This allows GradScaler to work correctly (it needs FP32 params)
+    ip_adapter = ip_adapter.to(device, dtype=torch.float32)
     
     # DDP with performance optimizations
     # - broadcast_buffers=False: No buffers to sync (image_proj and adapters have no buffers)
@@ -674,21 +677,22 @@ def main():
     #     print(f"LR Scheduler: {args.lr_scheduler}, Warmup steps: {args.lr_warmup_steps}, Total steps: {total_steps}")
     
     # Setup GradScaler for mixed precision
-    # CRITICAL: GradScaler is ONLY for FP16, NOT for BF16 or FP32
-    # BF16 has same range as FP32 and doesn't need gradient scaling
+    # For FP16: Use GradScaler to prevent gradient underflow (NaN loss)
+    # For BF16/FP32: No scaler needed (wider dynamic range)
+    # Key: Don't call unscale_() manually - let scaler.step() handle everything
     if args.mixed_precision == "fp16":
         scaler = GradScaler()
         if rank == 0:
-            print("✓ Using GradScaler for FP16 training")
+            print("✓ FP16 training with GradScaler (prevents gradient underflow)")
     else:
         scaler = None
         if rank == 0:
             if args.mixed_precision == "bf16":
-                print("✓ BF16 training (no GradScaler needed - BF16 is numerically stable)")
+                print("✓ BF16 training (no scaler needed - wider dynamic range)")
             elif args.mixed_precision == "no":
                 print("✓ FP32 training (no mixed precision)")
             else:
-                print(f"✓ Mixed precision: {args.mixed_precision} (no GradScaler)")
+                print(f"✓ Mixed precision: {args.mixed_precision}")
     
     # Verify scaler state
     if rank == 0:
@@ -843,39 +847,24 @@ def main():
                 else:
                     image_embeds_.append(image_embed)
             image_embeds = torch.stack(image_embeds_)
-
-            # breakpoint()
-            # # Convert image embeddings to weight_dtype for compatibility with UNet
-            # # This is safe: FP32 embeddings → FP16/BF16 for inference (no gradient)
-            # image_embeds = image_embeds.to(dtype=weight_dtype)
         
-            # Get text encoder hidden states (with mixed precision)
+            # Get text encoder hidden states (already in weight_dtype from text_encoder)
             with torch.no_grad():
                 encoder_hidden_states = text_encoder(batch["text_input_ids"].to(device))[0]
             
             # Forward pass with mixed precision
-            # Now all inputs (noisy_latents, encoder_hidden_states, image_embeds) are in weight_dtype
-            breakpoint()
+            # All inputs already in weight_dtype: noisy_latents (from VAE), encoder_hidden_states (from text_encoder), image_embeds (from BioCLIP/etc)
             with torch.cuda.amp.autocast(enabled=(args.mixed_precision != "no"), dtype=autocast_dtype):
                 noise_pred = ip_adapter(noisy_latents, timesteps, encoder_hidden_states, image_embeds, projection_flag=args.no_projection_layer)
                 loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
             
             # Backward pass with gradient clipping
-            # Clips gradients for BOTH image_proj_model AND adapter_modules (decoupled cross-attention)
-            
-            # Safety check: scaler should only exist for FP16
-            if scaler is not None and args.mixed_precision != "fp16":
-                raise RuntimeError(
-                    f"ERROR: GradScaler exists but mixed_precision={args.mixed_precision}. "
-                    f"GradScaler should ONLY be used with FP16, not BF16 or FP32!"
-                )
+            # With FP32 trainable params, GradScaler works correctly
             
             if scaler is not None:
-                # FP16 training with GradScaler
+                # FP16 with GradScaler (params are FP32, compute is FP16)
                 scaler.scale(loss).backward()
-                
-                # Unscale gradients before clipping (required for accurate clipping)
-                # This must be called before clip_grad_norm_
+                # Unscale before clipping for accurate gradient norms
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     itertools.chain(ip_adapter.module.image_proj_model.parameters(), 
@@ -884,9 +873,8 @@ def main():
                 )
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad()
             else:
-                # FP32 or BF16 training (no GradScaler needed for BF16)
+                # BF16 or FP32: standard backward pass
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     itertools.chain(ip_adapter.module.image_proj_model.parameters(), 
@@ -894,7 +882,8 @@ def main():
                     args.max_grad_norm
                 )
                 optimizer.step()
-                optimizer.zero_grad()
+            
+            optimizer.zero_grad()
             
             # LR Scheduler step (uncomment if using scheduler)
             # lr_scheduler.step()
