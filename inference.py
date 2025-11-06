@@ -109,16 +109,17 @@ def parse_args():
     p.add_argument("--steps", type=int, default=50)
     p.add_argument("--guidance_scale", type=float, default=3.5, help="guidance scale")
     p.add_argument("--scale", type=float, default=1.0, help="scale")
-    p.add_argument("--num_samples", type=int, default=4, help="images per prompt")
+    p.add_argument("--num_samples", type=int, default=10, help="images per prompt")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out_dir", default="outputs_bioclip")
     p.add_argument("--num_tokens", type=int, default=4, help="must match training")
     p.add_argument("--prompt", type=str, default=None, help="Prompt for image generation (optional).")
     p.add_argument("--taxonomic_prompt", action="store_true", help="If set, use taxonomic name as prompt.")
+    p.add_argument("--levels", type=int, default=7, help="Taxonomic levels to use (1=kingdom,...7=species).")
     
 
     p.add_argument("--json_file", required=True, help="Path to JSON list of dicts.")
-    p.add_argument("--model_type", type=str, default="bioclip", choices=["bioclip", "taxabind", "location", "clip"], help="Which model type was used during IP-Adapter training?")
+    p.add_argument("--model_type", type=str, default="bioclip", choices=["bioclip", "taxabind", "location", "clip", "taxa_loc_seq_concat", "loc_taxa_seq_concat"], help="Which model type was used during IP-Adapter training?")
     p.add_argument("--dataset", type=str, default="inat", choices=["inat", "fishnet"], help="Dataset type: 'inat' uses folder from image path, 'fishnet' uses taxonomic name")
     return p.parse_args()
 
@@ -130,34 +131,34 @@ def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 1) SD pipeline
+    # SD pipeline
     pipe = make_pipe(args.base_model, args.vae_model, device)
 
-    # 2) BioCLIP model + tokenizer
+    # BioCLIP/TaxaBind models and tokenizers
     bioclip_model, _, _ = open_clip.create_model_and_transforms("hf-hub:imageomics/bioclip-2")
     bioclip_tok = open_clip.get_tokenizer("hf-hub:imageomics/bioclip-2")
 
     config = PretrainedConfig.from_pretrained("MVRL/taxabind-config")
     taxabind = TaxaBind(config)
     location_encoder = taxabind.get_location_encoder().eval()
-    taxabind_image_text_model   = taxabind.get_image_text_encoder().eval()  # open_clip model
+    taxabind_image_text_model   = taxabind.get_image_text_encoder().eval()
     taxabind_tokenizer = taxabind.get_tokenizer()   
 
     if args.model_type == "bioclip":
         tokenizer = bioclip_tok
-    elif args.model_type == "taxabind":
+    elif args.model_type == "taxabind" or args.model_type == "taxa_loc_seq_concat" or args.model_type == "loc_taxa_seq_concat":
         tokenizer = taxabind_tokenizer
     elif args.model_type == "clip":
-        clip_ckpt = "openai/clip-vit-large-patch14"   # matches SD 1.x
+        clip_ckpt = "openai/clip-vit-large-patch14"
         tokenizer  = CLIPTokenizer.from_pretrained(clip_ckpt)
         clip_text_with_proj = CLIPTextModelWithProjection.from_pretrained(clip_ckpt).eval()
 
-    # 3) Load JSON
+    # Load JSON
     with open(args.json_file, "r") as f:
         items = json.load(f)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # --- NEW: de-duplicate by taxonomic_name (keep the FIRST full dict) ---
+    # de-duplicate by taxonomic_name
     seen = set()
     unique_items = []
     for ex in items:
@@ -169,7 +170,7 @@ def main():
     print(f"Found {len(unique_items)} unique taxonomic names (from {len(items)} rows).")
 
 
-    # 3) IP-Adapter wrapper 
+    # IP-Adapter wrapper 
     if args.model_type == "clip":
         print("Using CLIP model for IP-Adapter...")
         ip_model = IPAdapter(
@@ -194,11 +195,13 @@ def main():
             location_encoder=location_encoder
         )
 
-    # 4) Loop over entries and generate+save into per-class folder
-    # breakpoint()
     for idx, entry in tqdm(enumerate(unique_items, start=1), total=len(unique_items)):
         taxa_name = entry["taxonomic_name"]
         location = torch.tensor([entry["latitude"], entry["longitude"]])
+
+        if args.levels < 7:
+            taxa_parts = taxa_name.split(" ")
+            taxa_name = " ".join(taxa_parts[: args.levels])
         
         # Determine folder and save strategy based on dataset type
         if args.dataset == "fishnet":
@@ -225,12 +228,17 @@ def main():
                 return_tensors="pt"
             ).input_ids
             tokens = tokens.to(device)
+        elif args.model_type == "taxa_loc_seq_concat" or args.model_type == "loc_taxa_seq_concat":
+            taxa_tokens = tokenizer(taxa_name).to(device)
+            location = location.unsqueeze(0).to(device)
+            tokens = (taxa_tokens, location)
 
         # Generate images
         if args.taxonomic_prompt:
             prompt = 'best quality, high quality photo of ' + taxa_name
         else:
             prompt = args.prompt
+        
         images = ip_model.generate(
             pil_image=tokens,
             num_samples=args.num_samples,
@@ -258,4 +266,4 @@ if __name__ == "__main__":
     main()
 
 
-# python inference.py --ip_ckpt <path>/ip_adapter.bin --json_file <train_json> --out_dir /scratch/bio_diffusion/ip-adapter_runs/samples/<run> --num_samples 20 --model_type bioclip
+# python inference.py --ip_ckpt <path>/ip_adapter.bin --json_file <train_json> --out_dir /scratch/bio_diffusion/ip-adapter_runs/samples/<run> --num_samples 10 --model_type bioclip
